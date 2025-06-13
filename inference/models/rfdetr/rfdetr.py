@@ -57,7 +57,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         Returns:
             str: Path to the ONNX weights file.
         """
-        time.sleep(0.11)
+        time.sleep(0.12)
         return "weights.onnx"
 
     def preproc_image(
