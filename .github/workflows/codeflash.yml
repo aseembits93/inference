@@ -13,7 +13,6 @@ concurrency:
 
 jobs:
   optimize:
-    if: ${{ github.actor != 'codeflash-ai[bot]' && github.event.pull_request.head.repo.fork == false }}
     runs-on: ubuntu-latest
     env:
       CODEFLASH_API_KEY: ${{ secrets.CODEFLASH_API_KEY }}
