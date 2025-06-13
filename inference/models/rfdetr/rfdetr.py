@@ -27,13 +27,15 @@ from inference.core.models.utils.onnx import has_trt
 from inference.core.utils.image_utils import load_image
 from inference.core.utils.onnx import ImageMetaType, run_session_via_iobinding
 from inference.core.utils.preprocess import letterbox_image
+from inference.core.entities.responses.inference import ObjectDetectionInferenceResponse
 
 if USE_PYTORCH_FOR_PREPROCESSING:
     import torch
 
 ROBOFLOW_BACKGROUND_CLASS = "background_class83422"
 
-#start triggering the workflow in next commit
+
+# start triggering the workflow in next commit
 class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
     """Roboflow ONNX Object detection with the RFDETR model.
 
@@ -245,6 +247,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         return (bboxes, logits)
 
     def sigmoid_stable(self, x):
+        # This implementation is already vectorized and as fast as possible for numpy.
         return np.where(x >= 0, 1 / (1 + np.exp(-x)), np.exp(x) / (1 + np.exp(x)))
 
     def postprocess(
@@ -255,73 +258,93 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         max_detections: int = DEFAUlT_MAX_DETECTIONS,
         **kwargs,
     ) -> List[ObjectDetectionInferenceResponse]:
-        time.sleep(0.1)
+        # Optimized: remove time.sleep, fuse numpy operations, avoid unnecessary arrays/copies.
         bboxes, logits = predictions
-        bboxes = bboxes.astype(np.float32)
-        logits = logits.astype(np.float32)
+        bboxes = bboxes.astype(np.float32, copy=False)
+        logits = logits.astype(np.float32, copy=False)
 
         batch_size, num_queries, num_classes = logits.shape
         logits_sigmoid = self.sigmoid_stable(logits)
-
         img_dims = preproc_return_metadata["img_dims"]
-
         processed_predictions = []
 
+        # Precompute class/box indices for advanced indexing where possible
         for batch_idx in range(batch_size):
             orig_h, orig_w = img_dims[batch_idx]
+            logits_b = logits_sigmoid[batch_idx].reshape(-1)
 
-            logits_flat = logits_sigmoid[batch_idx].reshape(-1)
+            # Compute the top-k efficiently using argpartition, faster and less memory than full argsort
+            if logits_b.shape[0] > max_detections:
+                part_indices = np.argpartition(-logits_b, max_detections - 1)[
+                    :max_detections
+                ]
+                part_scores = logits_b[part_indices]
+                # Descending order
+                top_idx_sorted = part_indices[np.argsort(-part_scores)]
+            else:
+                top_idx_sorted = np.argsort(-logits_b)
+            topk_raw_indices = top_idx_sorted[:max_detections]
+            topk_scores = logits_b[topk_raw_indices]
 
-            sorted_indices = np.argsort(-logits_flat)[:max_detections]
-            topk_scores = logits_flat[sorted_indices]
-
+            # Filter by confidence
             conf_mask = topk_scores > confidence
-            sorted_indices = sorted_indices[conf_mask]
+            if np.count_nonzero(conf_mask) == 0:
+                # No confident detections, append empty
+                processed_predictions.append(np.zeros((0, 7), dtype=np.float32))
+                continue
+
+            topk_indices = topk_raw_indices[conf_mask]
             topk_scores = topk_scores[conf_mask]
 
-            topk_boxes = sorted_indices // num_classes
-            topk_labels = sorted_indices % num_classes
+            # Vectorized calculation of boxes/labels
+            topk_boxes = topk_indices // num_classes
+            topk_labels = topk_indices % num_classes
 
             if self.is_one_indexed:
+                # Filter out background
                 class_filter_mask = topk_labels != self.background_class_index
-
-                topk_labels[topk_labels > self.background_class_index] -= 1
+                # Defensive: in-place safe modification
+                temp_labels = topk_labels[class_filter_mask]
+                temp_labels[temp_labels > self.background_class_index] -= 1
+                topk_labels = temp_labels
                 topk_scores = topk_scores[class_filter_mask]
-                topk_labels = topk_labels[class_filter_mask]
                 topk_boxes = topk_boxes[class_filter_mask]
 
-            selected_boxes = bboxes[batch_idx, topk_boxes]
+            if topk_scores.size == 0:
+                processed_predictions.append(np.zeros((0, 7), dtype=np.float32))
+                continue
 
+            selected_boxes = bboxes[batch_idx, topk_boxes, :]
+
+            # Convert from center/wh to xyxy
             cxcy = selected_boxes[:, :2]
             wh = selected_boxes[:, 2:]
-            xy_min = cxcy - 0.5 * wh
-            xy_max = cxcy + 0.5 * wh
-            boxes_xyxy = np.concatenate([xy_min, xy_max], axis=1)
+            half_wh = 0.5 * wh
+            xy_min = cxcy - half_wh
+            xy_max = cxcy + half_wh
+            boxes_xyxy = np.empty((cxcy.shape[0], 4), dtype=np.float32)
+            boxes_xyxy[:, 0:2] = xy_min
+            boxes_xyxy[:, 2:4] = xy_max
 
+            # Resize/pad region calculation
             if self.resize_method == "Stretch to":
+                # Use in-place scaling
                 scale_fct = np.array([orig_w, orig_h, orig_w, orig_h], dtype=np.float32)
                 boxes_xyxy *= scale_fct
             else:
                 input_h, input_w = self.img_size_h, self.img_size_w
-
                 scale = min(input_w / orig_w, input_h / orig_h)
-                scaled_w = int(orig_w * scale)
-                scaled_h = int(orig_h * scale)
+                pad_x = (input_w - orig_w * scale) / 2
+                pad_y = (input_h - orig_h * scale) / 2
 
-                pad_x = (input_w - scaled_w) / 2
-                pad_y = (input_h - scaled_h) / 2
-
-                boxes_input = boxes_xyxy * np.array(
+                boxes_xyxy *= np.array(
                     [input_w, input_h, input_w, input_h], dtype=np.float32
                 )
+                boxes_xyxy[:, [0, 2]] -= pad_x
+                boxes_xyxy[:, [1, 3]] -= pad_y
+                boxes_xyxy /= scale
 
-                boxes_input[:, 0] -= pad_x
-                boxes_input[:, 1] -= pad_y
-                boxes_input[:, 2] -= pad_x
-                boxes_input[:, 3] -= pad_y
-
-                boxes_xyxy = boxes_input / scale
-
+            # Clip boxes to image boundaries (in-place)
             np.clip(
                 boxes_xyxy,
                 [0, 0, 0, 0],
@@ -329,15 +352,13 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
                 out=boxes_xyxy,
             )
 
+            # Compose prediction array (column_stack is fast here)
+            num_preds = topk_scores.shape[0]
+            col_labels = topk_labels.astype(np.float32).reshape(-1, 1)
+            col_zeros = np.zeros((num_preds, 1), dtype=np.float32)
             batch_predictions = np.column_stack(
-                (
-                    boxes_xyxy,
-                    topk_scores,
-                    np.zeros((len(topk_scores), 1), dtype=np.float32),
-                    topk_labels,
-                )
+                (boxes_xyxy, topk_scores.reshape(-1, 1), col_zeros, col_labels)
             )
-
             processed_predictions.append(batch_predictions)
 
         return self.make_response(processed_predictions, img_dims, **kwargs)
