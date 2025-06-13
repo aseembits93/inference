@@ -32,7 +32,7 @@ if USE_PYTORCH_FOR_PREPROCESSING:
 
 ROBOFLOW_BACKGROUND_CLASS = "background_class83422"
 
-
+#start triggering the workflow in next commit
 class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
     """Roboflow ONNX Object detection with the RFDETR model.
 
