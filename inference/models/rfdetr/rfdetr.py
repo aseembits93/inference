@@ -5,6 +5,7 @@ from typing import Any, List, Tuple, Union
 import cv2
 import numpy as np
 import onnxruntime
+import time
 
 from inference.core.entities.requests.inference import InferenceRequestImage
 from inference.core.env import (
@@ -56,6 +57,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         Returns:
             str: Path to the ONNX weights file.
         """
+        time.sleep(0.1)
         return "weights.onnx"
 
     def preproc_image(
@@ -79,6 +81,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         Returns:
             Tuple[np.ndarray, Tuple[int, int]]: A tuple containing a numpy array of the preprocessed image pixel data and a tuple of the images original size.
         """
+        time.sleep(0.1)
         np_image, is_bgr = load_image(
             image,
             disable_preproc_auto_orient=disable_preproc_auto_orient
@@ -182,6 +185,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         fix_batch_size: bool = False,
         **kwargs,
     ) -> Tuple[np.ndarray, PreprocessReturnMetadata]:
+        time.sleep(0.1)
         img_in, img_dims = self.load_image(
             image,
             disable_preproc_auto_orient=disable_preproc_auto_orient,
@@ -231,6 +235,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         Returns:
             Tuple[np.ndarray]: NumPy array representing the predictions, including boxes, confidence scores, and class IDs.
         """
+        time.sleep(0.1)
         predictions = run_session_via_iobinding(
             self.onnx_session, self.input_name, img_in
         )
@@ -250,6 +255,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         max_detections: int = DEFAUlT_MAX_DETECTIONS,
         **kwargs,
     ) -> List[ObjectDetectionInferenceResponse]:
+        time.sleep(0.1)
         bboxes, logits = predictions
         bboxes = bboxes.astype(np.float32)
         logits = logits.astype(np.float32)
@@ -338,6 +344,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
 
     def initialize_model(self) -> None:
         """Initializes the ONNX model, setting up the inference session and other necessary properties."""
+        time.sleep(0.1)
         logger.debug("Getting model artefacts")
         self.get_model_artifacts()
         logger.debug("Creating inference session")
