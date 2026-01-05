@@ -204,16 +204,22 @@ def count_detections_close_to_threshold(
     epsilon: float,
 ) -> int:
     counter = 0
-    for prediction_details in prediction["predictions"]:
-        if class_to_be_excluded(
-            class_name=prediction_details["class"],
-            selected_class_names=selected_class_names,
-        ):
-            continue
-        if is_close_to_threshold(
-            value=prediction_details["confidence"], threshold=threshold, epsilon=epsilon
-        ):
-            counter += 1
+    predictions = prediction["predictions"]
+
+    # Inline helper function logic to avoid function call overhead
+    if selected_class_names is None:
+        # No class filtering needed
+        for prediction_details in predictions:
+            if abs(prediction_details["confidence"] - threshold) < epsilon:
+                counter += 1
+    else:
+        # Class filtering required
+        for prediction_details in predictions:
+            if prediction_details["class"] not in selected_class_names:
+                continue
+            if abs(prediction_details["confidence"] - threshold) < epsilon:
+                counter += 1
+
     return counter
 
 
