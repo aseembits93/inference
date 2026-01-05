@@ -232,13 +232,19 @@ class ClipComparisonBlockV2(WorkflowBlock):
         predictions: List[dict],
         classes: List[str],
     ) -> List[dict]:
+        similarities_array = np.array([pred["similarity"] for pred in predictions])
+        max_similarities = np.max(similarities_array, axis=1)
+        max_similarity_ids = np.argmax(similarities_array, axis=1)
+        min_similarities = np.min(similarities_array, axis=1)
+        min_similarity_ids = np.argmin(similarities_array, axis=1)
+
         results = []
-        for prediction, image in zip(predictions, images):
+        for idx, (prediction, image) in enumerate(zip(predictions, images)):
             similarities = prediction["similarity"]
-            max_similarity = np.max(similarities)
-            max_similarity_id = np.argmax(similarities)
-            min_similarity = np.min(similarities)
-            min_similarity_id = np.argmin(similarities)
+            max_similarity = max_similarities[idx]
+            max_similarity_id = max_similarity_ids[idx]
+            min_similarity = min_similarities[idx]
+            min_similarity_id = min_similarity_ids[idx]
             most_similar_class_name = classes[max_similarity_id]
             least_similar_class_name = classes[min_similarity_id]
             prediction[PARENT_ID_KEY] = image.parent_metadata.parent_id
