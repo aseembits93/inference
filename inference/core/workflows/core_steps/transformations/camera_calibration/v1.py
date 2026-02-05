@@ -18,6 +18,7 @@ from inference.core.workflows.prototypes.block import (
     WorkflowBlock,
     WorkflowBlockManifest,
 )
+from functools import lru_cache
 
 OUTPUT_CALIBRATED_IMAGE_KEY: str = "calibrated_image"
 LONG_DESCRIPTION = """
@@ -215,17 +216,10 @@ def remove_distortions(
     img = image.numpy_image
     h, w = img.shape[:2]
 
-    cameraMatrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    distCoeffs = np.array([k1, k2, p1, p2, k3], dtype=np.float64)
-
-    # https://docs.opencv.org/4.11.0/d9/d0c/group__calib3d.html#ga7a6c4e032c97f03ba747966e6ad862b1
-    newcameramtx, roi = cv.getOptimalNewCameraMatrix(
-        cameraMatrix=cameraMatrix,
-        distCoeffs=distCoeffs,
-        imageSize=(w, h),
-        alpha=1,
-        newImgSize=(w, h),
+    cameraMatrix, distCoeffs, newcameramtx = _get_optimal_camera_matrix(
+        fx=fx, fy=fy, cx=cx, cy=cy, k1=k1, k2=k2, k3=k3, p1=p1, p2=p2, w=w, h=h
     )
+
     # https://docs.opencv.org/4.11.0/d9/d0c/group__calib3d.html#ga69f2545a8b62a6b0fc2ee060dc30559d
     dst = cv.undistort(
         src=img,
@@ -238,3 +232,32 @@ def remove_distortions(
         parent_metadata=image.parent_metadata,
         numpy_image=dst,
     )
+
+
+@lru_cache(maxsize=128)
+def _get_optimal_camera_matrix(
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    k1: float,
+    k2: float,
+    k3: float,
+    p1: float,
+    p2: float,
+    w: int,
+    h: int,
+):
+    """Cache the optimal camera matrix calculation since it only depends on parameters."""
+    cameraMatrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    distCoeffs = np.array([k1, k2, p1, p2, k3], dtype=np.float64)
+
+    # https://docs.opencv.org/4.11.0/d9/d0c/group__calib3d.html#ga7a6c4e032c97f03ba747966e6ad862b1
+    newcameramtx, roi = cv.getOptimalNewCameraMatrix(
+        cameraMatrix=cameraMatrix,
+        distCoeffs=distCoeffs,
+        imageSize=(w, h),
+        alpha=1,
+        newImgSize=(w, h),
+    )
+    return cameraMatrix, distCoeffs, newcameramtx
