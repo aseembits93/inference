@@ -238,7 +238,18 @@ class RFDetrForObjectDetectionTRT(
                 input_color_format=input_color_format,
                 pre_processing_overrides=pre_processing_overrides,
             )
-        self._pre_process_stream.synchronize()
+        if self._trt_cuda_graph_cache is not None:
+            # CUDA graphs replay a fixed sequence of operations and do not
+            # respect cross-stream event waits placed outside the captured
+            # graph.  A full synchronize is therefore required so the input
+            # tensor is ready before the graph is replayed.
+            self._pre_process_stream.synchronize()
+        else:
+            # Without CUDA graphs the inference stream can simply wait on an
+            # event recorded on the preprocess stream, allowing the CPU to
+            # proceed immediately without blocking.
+            event = self._pre_process_stream.record_event()
+            self._inference_stream.wait_event(event)
         return pre_processed_images, pre_processing_meta
 
     def forward(
