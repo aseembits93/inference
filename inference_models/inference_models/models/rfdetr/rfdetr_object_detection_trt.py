@@ -29,9 +29,6 @@ from inference_models.models.common.roboflow.model_packages import (
     parse_inference_config,
     parse_trt_config,
 )
-from inference_models.models.common.roboflow.post_processing import (
-    rescale_image_detections,
-)
 from inference_models.models.common.trt import (
     TRTCudaGraphCache,
     establish_trt_cuda_graph_cache,
@@ -44,6 +41,7 @@ from inference_models.models.rfdetr.class_remapping import (
     prepare_class_remapping,
 )
 from inference_models.models.rfdetr.pre_processing import pre_process_network_input
+from inference_models.models.rfdetr.triton_postprocess import launch_fused_postprocess
 
 try:
     import tensorrt as trt
@@ -201,6 +199,16 @@ class RFDetrForObjectDetectionTRT(
         self._inference_config = inference_config
         self._class_names = class_names
         self._classes_re_mapping = classes_re_mapping
+        if classes_re_mapping is not None:
+            self._remap_remaining_np = (
+                classes_re_mapping.remaining_class_ids.cpu().numpy()
+            )
+            self._remap_mapping_np = (
+                classes_re_mapping.class_mapping.cpu().numpy()
+            )
+        else:
+            self._remap_remaining_np = None
+            self._remap_mapping_np = None
         self._device = device
         self._cuda_context = cuda_context
         self._execution_context = execution_context
@@ -230,7 +238,18 @@ class RFDetrForObjectDetectionTRT(
                 input_color_format=input_color_format,
                 pre_processing_overrides=pre_processing_overrides,
             )
-        self._pre_process_stream.synchronize()
+        if self._trt_cuda_graph_cache is not None:
+            # CUDA graphs replay a fixed sequence of operations and do not
+            # respect cross-stream event waits placed outside the captured
+            # graph.  A full synchronize is therefore required so the input
+            # tensor is ready before the graph is replayed.
+            self._pre_process_stream.synchronize()
+        else:
+            # Without CUDA graphs the inference stream can simply wait on an
+            # event recorded on the preprocess stream, allowing the CPU to
+            # proceed immediately without blocking.
+            event = self._pre_process_stream.record_event()
+            self._inference_stream.wait_event(event)
         return pre_processed_images, pre_processing_meta
 
     def forward(
@@ -262,64 +281,89 @@ class RFDetrForObjectDetectionTRT(
         confidence: float = INFERENCE_MODELS_RFDETR_DEFAULT_CONFIDENCE,
         **kwargs,
     ) -> List[Detections]:
+        bboxes, logits = model_results
+        batch_size = logits.shape[0]
+        num_queries = logits.shape[1]
+        num_classes = logits.shape[2]
+        # Single Triton kernel per image: sigmoid + max + box transform,
+        # writing directly to a pinned CPU buffer over PCIe. This fuses
+        # compute + D2H into one kernel launch with zero gap.
+        cpu_buf = self._get_postprocess_cpu_buffer(num_queries, batch_size)
+        kernel_args = []
+        for i, image_meta in enumerate(pre_processing_meta):
+            denorm_size = (
+                image_meta.nonsquare_intermediate_size
+                or image_meta.inference_size
+            )
+            kernel_args.append((
+                logits[i], bboxes[i], cpu_buf[i], num_classes,
+                float(denorm_size.width), float(denorm_size.height),
+                1.0 / image_meta.scale_width, 1.0 / image_meta.scale_height,
+                float(image_meta.pad_left), float(image_meta.pad_top),
+                float(image_meta.static_crop_offset.offset_x),
+                float(image_meta.static_crop_offset.offset_y),
+            ))
         with torch.cuda.stream(self._post_process_stream):
             for result_element in model_results:
                 result_element.record_stream(self._post_process_stream)
-            bboxes, logits = model_results
-            logits_sigmoid = torch.nn.functional.sigmoid(logits)
-            results = []
-            for image_bboxes, image_logits, image_meta in zip(
-                bboxes, logits_sigmoid, pre_processing_meta
-            ):
-                predicted_confidence, top_classes = image_logits.max(dim=1)
-                confidence_mask = predicted_confidence > confidence
-                predicted_confidence = predicted_confidence[confidence_mask]
-                top_classes = top_classes[confidence_mask]
-                selected_boxes = image_bboxes[confidence_mask]
-                predicted_confidence, sorted_indices = torch.sort(
-                    predicted_confidence, descending=True
-                )
-                top_classes = top_classes[sorted_indices]
-                selected_boxes = selected_boxes[sorted_indices]
-                if self._classes_re_mapping is not None:
-                    remapping_mask = torch.isin(
-                        top_classes, self._classes_re_mapping.remaining_class_ids
-                    )
-                    top_classes = self._classes_re_mapping.class_mapping[
-                        top_classes[remapping_mask]
-                    ]
-                    selected_boxes = selected_boxes[remapping_mask]
-                    predicted_confidence = predicted_confidence[remapping_mask]
-                cxcy = selected_boxes[:, :2]
-                wh = selected_boxes[:, 2:]
-                xy_min = cxcy - 0.5 * wh
-                xy_max = cxcy + 0.5 * wh
-                selected_boxes_xyxy_pct = torch.cat([xy_min, xy_max], dim=-1)
-                denorm_size = (
-                    image_meta.nonsquare_intermediate_size or image_meta.inference_size
-                )
-                inference_size_whwh = torch.tensor(
-                    [
-                        denorm_size.width,
-                        denorm_size.height,
-                        denorm_size.width,
-                        denorm_size.height,
-                    ],
-                    device=self._device,
-                )
-                selected_boxes_xyxy = selected_boxes_xyxy_pct * inference_size_whwh
-                selected_boxes_xyxy = rescale_image_detections(
-                    image_detections=selected_boxes_xyxy,
-                    image_metadata=image_meta,
-                )
-                detections = Detections(
-                    xyxy=selected_boxes_xyxy.round().int(),
-                    confidence=predicted_confidence,
-                    class_id=top_classes.int(),
-                )
-                results.append(detections)
+            for args in kernel_args:
+                launch_fused_postprocess(*args)
         self._post_process_stream.synchronize()
+        # CPU phase: threshold + sort + class remap on ≤300 elements.
+        # Uses numpy for faster small-array CPU operations, then wraps
+        # via torch.from_numpy (zero-copy) for the Detections dataclass.
+        output_np = cpu_buf[:batch_size].numpy()
+        remap = self._classes_re_mapping
+        if remap is not None:
+            remap_remaining = self._remap_remaining_np
+            remap_mapping = self._remap_mapping_np
+        results = []
+        for i in range(batch_size):
+            row = output_np[i]  # [num_queries, 6]
+            conf = row[:, 0]
+            keep = conf > confidence
+            if not keep.any():
+                results.append(Detections(
+                    xyxy=torch.empty((0, 4), dtype=torch.int32),
+                    confidence=torch.empty((0,)),
+                    class_id=torch.empty((0,), dtype=torch.int32),
+                ))
+                continue
+            conf_k = conf[keep]
+            cls_k = row[keep, 1]
+            xyxy_k = row[keep, 2:6]
+            order = np.argsort(-conf_k)
+            conf_sorted = conf_k[order]
+            cls_sorted = cls_k[order]
+            xyxy_sorted = xyxy_k[order]
+            if remap is not None:
+                cls_int = cls_sorted.astype(np.intp)
+                remapping_mask = np.isin(cls_int, remap_remaining)
+                cls_sorted = remap_mapping[cls_int[remapping_mask]]
+                xyxy_sorted = xyxy_sorted[remapping_mask]
+                conf_sorted = conf_sorted[remapping_mask]
+            results.append(Detections(
+                xyxy=torch.from_numpy(
+                    np.round(xyxy_sorted).astype(np.int32)
+                ),
+                confidence=torch.from_numpy(conf_sorted.copy()),
+                class_id=torch.from_numpy(cls_sorted.astype(np.int32)),
+            ))
         return results
+
+    def _get_postprocess_cpu_buffer(
+        self, num_queries: int, batch_size: int
+    ) -> torch.Tensor:
+        """Return a pre-allocated pinned CPU buffer for D2H copy."""
+        storage = self._thread_local_storage
+        buf = getattr(storage, "postprocess_cpu_buf", None)
+        if buf is None or buf.shape[0] < batch_size or buf.shape[1] < num_queries:
+            storage.postprocess_cpu_buf = torch.empty(
+                (max(batch_size, 1), num_queries, 6),
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+        return storage.postprocess_cpu_buf
 
     @property
     def _pre_process_stream(self) -> torch.cuda.Stream:

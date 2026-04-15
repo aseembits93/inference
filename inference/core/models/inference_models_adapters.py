@@ -158,6 +158,10 @@ class InferenceModelsObjectDetectionAdapter(Model):
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
 
+        class_filter = kwargs.get("class_filter")
+        class_names = self.class_names
+        num_classes = len(class_names)
+
         responses: List[ObjectDetectionInferenceResponse] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):
             H = preproc_metadata.original_size.height
@@ -167,31 +171,29 @@ class InferenceModelsObjectDetectionAdapter(Model):
             confs = det.confidence.detach().cpu().numpy()
             class_ids = det.class_id.detach().cpu().numpy()
 
-            predictions: List[ObjectDetectionPrediction] = []
+            # Vectorized cx/cy/w/h from xyxy
+            cx_arr = (xyxy[:, 0] + xyxy[:, 2]) * 0.5
+            cy_arr = (xyxy[:, 1] + xyxy[:, 3]) * 0.5
+            w_arr = xyxy[:, 2] - xyxy[:, 0]
+            h_arr = xyxy[:, 3] - xyxy[:, 1]
 
-            for (x1, y1, x2, y2), conf, class_id in zip(xyxy, confs, class_ids):
-                cx = (float(x1) + float(x2)) / 2.0
-                cy = (float(y1) + float(y2)) / 2.0
-                w = float(x2) - float(x1)
-                h = float(y2) - float(y1)
-                class_id_int = int(class_id)
+            predictions: List[ObjectDetectionPrediction] = []
+            for i in range(len(confs)):
+                class_id_int = int(class_ids[i])
                 class_name = (
-                    self.class_names[class_id_int]
-                    if 0 <= class_id_int < len(self.class_names)
+                    class_names[class_id_int]
+                    if 0 <= class_id_int < num_classes
                     else str(class_id_int)
                 )
-                if (
-                    kwargs.get("class_filter")
-                    and class_name not in kwargs["class_filter"]
-                ):
+                if class_filter and class_name not in class_filter:
                     continue
                 predictions.append(
                     ObjectDetectionPrediction(
-                        x=cx,
-                        y=cy,
-                        width=w,
-                        height=h,
-                        confidence=float(conf),
+                        x=float(cx_arr[i]),
+                        y=float(cy_arr[i]),
+                        width=float(w_arr[i]),
+                        height=float(h_arr[i]),
+                        confidence=float(confs[i]),
                         **{"class": class_name},
                         class_id=class_id_int,
                     )
