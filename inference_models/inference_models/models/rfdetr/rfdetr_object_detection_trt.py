@@ -199,6 +199,16 @@ class RFDetrForObjectDetectionTRT(
         self._inference_config = inference_config
         self._class_names = class_names
         self._classes_re_mapping = classes_re_mapping
+        if classes_re_mapping is not None:
+            self._remap_remaining_np = (
+                classes_re_mapping.remaining_class_ids.cpu().numpy()
+            )
+            self._remap_mapping_np = (
+                classes_re_mapping.class_mapping.cpu().numpy()
+            )
+        else:
+            self._remap_remaining_np = None
+            self._remap_mapping_np = None
         self._device = device
         self._cuda_context = cuda_context
         self._execution_context = execution_context
@@ -288,14 +298,18 @@ class RFDetrForObjectDetectionTRT(
             for args in kernel_args:
                 launch_fused_postprocess(*args)
         self._post_process_stream.synchronize()
-        output_cpu = cpu_buf[:batch_size]
         # CPU phase: threshold + sort + class remap on ≤300 elements.
+        # Uses numpy for faster small-array CPU operations, then wraps
+        # via torch.from_numpy (zero-copy) for the Detections dataclass.
+        output_np = cpu_buf[:batch_size].numpy()
+        remap = self._classes_re_mapping
+        if remap is not None:
+            remap_remaining = self._remap_remaining_np
+            remap_mapping = self._remap_mapping_np
         results = []
-        for i, image_meta in enumerate(pre_processing_meta):
-            row = output_cpu[i]  # [num_queries, 6]
+        for i in range(batch_size):
+            row = output_np[i]  # [num_queries, 6]
             conf = row[:, 0]
-            cls_ids = row[:, 1]
-            xyxy = row[:, 2:6]
             keep = conf > confidence
             if not keep.any():
                 results.append(Detections(
@@ -305,26 +319,24 @@ class RFDetrForObjectDetectionTRT(
                 ))
                 continue
             conf_k = conf[keep]
-            cls_k = cls_ids[keep]
-            xyxy_k = xyxy[keep]
-            order = conf_k.argsort(descending=True)
-            predicted_confidence = conf_k[order]
-            top_classes = cls_k[order]
-            selected_xyxy = xyxy_k[order]
-            if self._classes_re_mapping is not None:
-                remapping_mask = torch.isin(
-                    top_classes.int(),
-                    self._classes_re_mapping.remaining_class_ids.cpu(),
-                )
-                top_classes = self._classes_re_mapping.class_mapping.cpu()[
-                    top_classes[remapping_mask].int()
-                ]
-                selected_xyxy = selected_xyxy[remapping_mask]
-                predicted_confidence = predicted_confidence[remapping_mask]
+            cls_k = row[keep, 1]
+            xyxy_k = row[keep, 2:6]
+            order = np.argsort(-conf_k)
+            conf_sorted = conf_k[order]
+            cls_sorted = cls_k[order]
+            xyxy_sorted = xyxy_k[order]
+            if remap is not None:
+                cls_int = cls_sorted.astype(np.intp)
+                remapping_mask = np.isin(cls_int, remap_remaining)
+                cls_sorted = remap_mapping[cls_int[remapping_mask]]
+                xyxy_sorted = xyxy_sorted[remapping_mask]
+                conf_sorted = conf_sorted[remapping_mask]
             results.append(Detections(
-                xyxy=selected_xyxy.round().to(torch.int32),
-                confidence=predicted_confidence,
-                class_id=top_classes.to(torch.int32),
+                xyxy=torch.from_numpy(
+                    np.round(xyxy_sorted).astype(np.int32)
+                ),
+                confidence=torch.from_numpy(conf_sorted.copy()),
+                class_id=torch.from_numpy(cls_sorted.astype(np.int32)),
             ))
         return results
 
