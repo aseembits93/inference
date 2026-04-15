@@ -194,44 +194,24 @@ def rescale_image_detections(
     image_detections: torch.Tensor,
     image_metadata: PreProcessingMetadata,
 ) -> torch.Tensor:
-    # in-place processing
-    offsets = torch.as_tensor(
-        [
-            image_metadata.pad_left,
-            image_metadata.pad_top,
-            image_metadata.pad_left,
-            image_metadata.pad_top,
-        ],
-        dtype=image_detections.dtype,
-        device=image_detections.device,
-    )
-    image_detections[:, :4].sub_(offsets)  # in-place subtraction for speed/memory
-    scale = torch.as_tensor(
-        [
-            image_metadata.scale_width,
-            image_metadata.scale_height,
-            image_metadata.scale_width,
-            image_metadata.scale_height,
-        ],
-        dtype=image_detections.dtype,
-        device=image_detections.device,
-    )
-    image_detections[:, :4].div_(scale)
+    # in-place processing using scalar ops per column to avoid creating GPU
+    # tensors from Python lists (which cause pageable H2D copies each call)
+    image_detections[:, 0].sub_(image_metadata.pad_left)
+    image_detections[:, 1].sub_(image_metadata.pad_top)
+    image_detections[:, 2].sub_(image_metadata.pad_left)
+    image_detections[:, 3].sub_(image_metadata.pad_top)
+    image_detections[:, 0].div_(image_metadata.scale_width)
+    image_detections[:, 1].div_(image_metadata.scale_height)
+    image_detections[:, 2].div_(image_metadata.scale_width)
+    image_detections[:, 3].div_(image_metadata.scale_height)
     if (
         image_metadata.static_crop_offset.offset_x != 0
         or image_metadata.static_crop_offset.offset_y != 0
     ):
-        static_crop_offsets = torch.as_tensor(
-            [
-                image_metadata.static_crop_offset.offset_x,
-                image_metadata.static_crop_offset.offset_y,
-                image_metadata.static_crop_offset.offset_x,
-                image_metadata.static_crop_offset.offset_y,
-            ],
-            dtype=image_detections.dtype,
-            device=image_detections.device,
-        )
-        image_detections[:, :4].add_(static_crop_offsets)
+        image_detections[:, 0].add_(image_metadata.static_crop_offset.offset_x)
+        image_detections[:, 1].add_(image_metadata.static_crop_offset.offset_y)
+        image_detections[:, 2].add_(image_metadata.static_crop_offset.offset_x)
+        image_detections[:, 3].add_(image_metadata.static_crop_offset.offset_y)
     return image_detections
 
 

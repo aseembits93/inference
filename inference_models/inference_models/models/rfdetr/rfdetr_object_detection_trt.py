@@ -29,9 +29,6 @@ from inference_models.models.common.roboflow.model_packages import (
     parse_inference_config,
     parse_trt_config,
 )
-from inference_models.models.common.roboflow.post_processing import (
-    rescale_image_detections,
-)
 from inference_models.models.common.trt import (
     TRTCudaGraphCache,
     establish_trt_cuda_graph_cache,
@@ -262,63 +259,79 @@ class RFDetrForObjectDetectionTRT(
         confidence: float = INFERENCE_MODELS_RFDETR_DEFAULT_CONFIDENCE,
         **kwargs,
     ) -> List[Detections]:
+        bboxes, logits = model_results
+        # GPU phase: only sigmoid + max on the full 300x91 logits tensor,
+        # where GPU parallelism matters. Then bulk-transfer all 300 scores,
+        # class IDs, and boxes to CPU (total ~8KB — negligible on PCIe).
+        # This minimises GPU kernel launches to ~2 (sigmoid, reduce_max)
+        # plus D2H copies, avoiding the ~25us Python→CUDA dispatch overhead
+        # that dominated prior approaches with many small GPU ops.
         with torch.cuda.stream(self._post_process_stream):
             for result_element in model_results:
                 result_element.record_stream(self._post_process_stream)
-            bboxes, logits = model_results
-            logits_sigmoid = torch.nn.functional.sigmoid(logits)
-            results = []
-            for image_bboxes, image_logits, image_meta in zip(
-                bboxes, logits_sigmoid, pre_processing_meta
-            ):
-                predicted_confidence, top_classes = image_logits.max(dim=1)
-                confidence_mask = predicted_confidence > confidence
-                predicted_confidence = predicted_confidence[confidence_mask]
-                top_classes = top_classes[confidence_mask]
-                selected_boxes = image_bboxes[confidence_mask]
-                predicted_confidence, sorted_indices = torch.sort(
-                    predicted_confidence, descending=True
-                )
-                top_classes = top_classes[sorted_indices]
-                selected_boxes = selected_boxes[sorted_indices]
-                if self._classes_re_mapping is not None:
-                    remapping_mask = torch.isin(
-                        top_classes, self._classes_re_mapping.remaining_class_ids
-                    )
-                    top_classes = self._classes_re_mapping.class_mapping[
-                        top_classes[remapping_mask]
-                    ]
-                    selected_boxes = selected_boxes[remapping_mask]
-                    predicted_confidence = predicted_confidence[remapping_mask]
-                cxcy = selected_boxes[:, :2]
-                wh = selected_boxes[:, 2:]
-                xy_min = cxcy - 0.5 * wh
-                xy_max = cxcy + 0.5 * wh
-                selected_boxes_xyxy_pct = torch.cat([xy_min, xy_max], dim=-1)
-                denorm_size = (
-                    image_meta.nonsquare_intermediate_size or image_meta.inference_size
-                )
-                inference_size_whwh = torch.tensor(
-                    [
-                        denorm_size.width,
-                        denorm_size.height,
-                        denorm_size.width,
-                        denorm_size.height,
-                    ],
-                    device=self._device,
-                )
-                selected_boxes_xyxy = selected_boxes_xyxy_pct * inference_size_whwh
-                selected_boxes_xyxy = rescale_image_detections(
-                    image_detections=selected_boxes_xyxy,
-                    image_metadata=image_meta,
-                )
-                detections = Detections(
-                    xyxy=selected_boxes_xyxy.round().int(),
-                    confidence=predicted_confidence,
-                    class_id=top_classes.int(),
-                )
-                results.append(detections)
+            logits_sigmoid = logits.sigmoid()
+            max_conf, max_cls = logits_sigmoid.max(dim=2)
+            # Bulk transfer to CPU — 3 async copies back-to-back
+            bboxes_cpu = bboxes.cpu()
+            max_conf_cpu = max_conf.cpu()
+            max_cls_cpu = max_cls.cpu()
         self._post_process_stream.synchronize()
+        # CPU phase: threshold + sort + class remapping + cxcywh→xyxy +
+        # denormalize + rescale. On ~300-element tensors, CPU is faster
+        # than GPU due to eliminated kernel launch overhead.
+        results = []
+        for image_bboxes, image_conf, image_cls, image_meta in zip(
+            bboxes_cpu, max_conf_cpu, max_cls_cpu, pre_processing_meta
+        ):
+            keep = image_conf > confidence
+            if not keep.any():
+                results.append(Detections(
+                    xyxy=torch.empty((0, 4), dtype=torch.int32),
+                    confidence=torch.empty((0,)),
+                    class_id=torch.empty((0,), dtype=torch.int32),
+                ))
+                continue
+            kept_conf = image_conf[keep]
+            kept_cls = image_cls[keep]
+            kept_boxes = image_bboxes[keep]
+            order = kept_conf.argsort(descending=True)
+            predicted_confidence = kept_conf[order]
+            top_classes = kept_cls[order]
+            selected_boxes = kept_boxes[order]
+            if self._classes_re_mapping is not None:
+                remapping_mask = torch.isin(
+                    top_classes,
+                    self._classes_re_mapping.remaining_class_ids.cpu(),
+                )
+                top_classes = self._classes_re_mapping.class_mapping.cpu()[
+                    top_classes[remapping_mask]
+                ]
+                selected_boxes = selected_boxes[remapping_mask]
+                predicted_confidence = predicted_confidence[remapping_mask]
+            denorm_size = (
+                image_meta.nonsquare_intermediate_size or image_meta.inference_size
+            )
+            dw = denorm_size.width
+            dh = denorm_size.height
+            sw = image_meta.scale_width
+            sh = image_meta.scale_height
+            pad_l = image_meta.pad_left
+            pad_t = image_meta.pad_top
+            crop_x = image_meta.static_crop_offset.offset_x
+            crop_y = image_meta.static_crop_offset.offset_y
+            cx, cy = selected_boxes[:, 0], selected_boxes[:, 1]
+            half_w = selected_boxes[:, 2] * 0.5
+            half_h = selected_boxes[:, 3] * 0.5
+            x1 = ((cx - half_w) * dw - pad_l) / sw + crop_x
+            y1 = ((cy - half_h) * dh - pad_t) / sh + crop_y
+            x2 = ((cx + half_w) * dw - pad_l) / sw + crop_x
+            y2 = ((cy + half_h) * dh - pad_t) / sh + crop_y
+            xyxy = torch.stack([x1, y1, x2, y2], dim=1).round().to(torch.int32)
+            results.append(Detections(
+                xyxy=xyxy,
+                confidence=predicted_confidence,
+                class_id=top_classes.to(torch.int32),
+            ))
         return results
 
     @property
