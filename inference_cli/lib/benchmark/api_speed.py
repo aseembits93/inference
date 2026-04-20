@@ -255,8 +255,7 @@ def execute_infer_api_request(
 ) -> None:
     if delay:
         time.sleep(random.random())
-    random.shuffle(images)
-    payload = images[:request_batch_size]
+    payload = random.sample(images, min(request_batch_size, len(images)))
     start = time.time()
     try:
         if client.client_mode is HTTPClientMode.V0:
@@ -312,8 +311,8 @@ def execute_workflow_api_request(
 ) -> None:
     if delay:
         time.sleep(random.random())
-    random.shuffle(images)
-    images = {f"image": images[:request_batch_size]}
+    selected_images = random.sample(images, min(request_batch_size, len(images)))
+    images = {f"image": selected_images}
     start = time.time()
     try:
         kwargs = {

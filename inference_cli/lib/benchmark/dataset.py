@@ -1,4 +1,5 @@
 import os.path
+from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 from itertools import chain
 from typing import List, Optional
@@ -45,16 +46,15 @@ def load_images(
                 glob(os.path.join(directory, f"*{e}")) for e in IMAGE_EXTENSIONS
             )
         )
-    )
-    results = []
-    progress_bar = tqdm(desc="Loading images...", total=max_images_to_load)
-    for file_path in file_paths:
-        image = load_image(path=file_path)
-        if image is None:
-            continue
-        results.append(image)
-        progress_bar.update()
-    progress_bar.close()
+    )[:max_images_to_load]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results_iter = executor.map(load_image, file_paths)
+        results = [
+            img for img in tqdm(results_iter, desc="Loading images...", total=len(file_paths))
+            if img is not None
+        ]
+
     if len(results) < 1:
         raise DatasetLoadingError(f"Could not load images from {directory}")
     return results
@@ -69,11 +69,16 @@ def load_image(path: str) -> Optional[np.ndarray]:
 
 
 def download_images(urls: List[str]) -> List[np.ndarray]:
-    results = [download_image(url=url) for url in tqdm(urls, "Loading images...")]
-    non_empty_results = [r for r in results if r is not None]
-    if len(non_empty_results) < 1:
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results_iter = executor.map(download_image, urls)
+        results = [
+            img for img in tqdm(results_iter, desc="Loading images...", total=len(urls))
+            if img is not None
+        ]
+
+    if len(results) < 1:
         raise DatasetLoadingError(f"Could not load images")
-    return non_empty_results
+    return results
 
 
 def download_image(url: str) -> Optional[np.ndarray]:
