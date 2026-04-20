@@ -42,6 +42,7 @@ def run_python_package_speed_benchmark(
         inference_configuration=inference_configuration,
         image=images[0],
         warm_up_inferences=warm_up_inferences,
+        all_images=images,
     )
     run_benchmark(
         model=model,
@@ -58,11 +59,16 @@ def run_model_warm_up(
     inference_configuration: Dict[str, Any],
     image: np.ndarray,
     warm_up_inferences: int,
+    all_images: Optional[List[np.ndarray]] = None,
 ) -> None:
-    for _ in tqdm(
+    for i in tqdm(
         range(warm_up_inferences), desc="Warming up model...", total=warm_up_inferences
     ):
-        _ = model.infer(image, **inference_configuration)
+        if all_images is not None and len(all_images) > 0:
+            warm_up_image = all_images[i % len(all_images)]
+        else:
+            warm_up_image = image
+        _ = model.infer(warm_up_image, **inference_configuration)
 
 
 def run_benchmark(
@@ -78,13 +84,21 @@ def run_benchmark(
     results_collector.start_benchmark()
     try:
         for _ in range(benchmark_inferences):
-            random.shuffle(images)
-            payload = images[:batch_size]
+            payload = random.sample(images, min(batch_size, len(images)))
             start = time.time()
-            _ = model.infer(payload, **inference_configuration)
-            duration = time.time() - start
-            results_collector.register_inference_duration(
-                batch_size=batch_size, duration=duration
-            )
+            try:
+                _ = model.infer(payload, **inference_configuration)
+                duration = time.time() - start
+                results_collector.register_inference_duration(
+                    batch_size=batch_size, duration=duration
+                )
+            except Exception as exc:
+                duration = time.time() - start
+                results_collector.register_inference_duration(
+                    batch_size=batch_size, duration=duration
+                )
+                results_collector.register_error(
+                    batch_size=batch_size, status_code=exc.__class__.__name__
+                )
     finally:
         results_collector.stop_benchmark()
