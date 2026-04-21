@@ -221,62 +221,25 @@ def rescale_key_points_detections(
     key_points_slots_in_prediction: int,
 ) -> List[torch.Tensor]:
     for image_detections, metadata in zip(detections, images_metadata):
-        offsets = torch.as_tensor(
-            [metadata.pad_left, metadata.pad_top, metadata.pad_left, metadata.pad_top],
-            dtype=image_detections.dtype,
-            device=image_detections.device,
-        )
-        image_detections[:, :4].sub_(offsets)  # in-place subtraction for speed/memory
-        scale = torch.as_tensor(
-            [
-                metadata.scale_width,
-                metadata.scale_height,
-                metadata.scale_width,
-                metadata.scale_height,
-            ],
-            dtype=image_detections.dtype,
-            device=image_detections.device,
-        )
-        image_detections[:, :4].div_(scale)
-        key_points_offsets = torch.as_tensor(
-            [metadata.pad_left, metadata.pad_top, 0],
-            dtype=image_detections.dtype,
-            device=image_detections.device,
-        ).repeat(key_points_slots_in_prediction)
-        image_detections[:, 6:].sub_(key_points_offsets)
-        key_points_scale = torch.as_tensor(
-            [metadata.scale_width, metadata.scale_height, 1.0],
-            dtype=image_detections.dtype,
-            device=image_detections.device,
-        ).repeat(key_points_slots_in_prediction)
-        image_detections[:, 6:].div_(key_points_scale)
-        if (
-            metadata.static_crop_offset.offset_x != 0
-            or metadata.static_crop_offset.offset_y != 0
-        ):
-            static_crop_offset_length = (image_detections.shape[1] - 6) // 3
-            static_crop_offsets = torch.as_tensor(
-                [
-                    metadata.static_crop_offset.offset_x,
-                    metadata.static_crop_offset.offset_y,
-                    0,
-                ]
-                * static_crop_offset_length,
-                dtype=image_detections.dtype,
-                device=image_detections.device,
-            )
-            image_detections[:, 6:].add_(static_crop_offsets)
-            static_crop_offsets = torch.as_tensor(
-                [
-                    metadata.static_crop_offset.offset_x,
-                    metadata.static_crop_offset.offset_y,
-                    metadata.static_crop_offset.offset_x,
-                    metadata.static_crop_offset.offset_y,
-                ],
-                dtype=image_detections.dtype,
-                device=image_detections.device,
-            )
-            image_detections[:, :4].add_(static_crop_offsets)
+        pad_left = metadata.pad_left
+        pad_top = metadata.pad_top
+        scale_w = metadata.scale_width
+        scale_h = metadata.scale_height
+        # xyxy columns: [x1, y1, x2, y2]
+        image_detections[:, 0:4:2].sub_(pad_left).div_(scale_w)
+        image_detections[:, 1:4:2].sub_(pad_top).div_(scale_h)
+        # key points triples: (x, y, conf) repeated ``key_points_slots_in_prediction`` times
+        # starting at column 6. The x/y columns follow a stride-3 pattern; conf
+        # is left untouched.
+        image_detections[:, 6::3].sub_(pad_left).div_(scale_w)
+        image_detections[:, 7::3].sub_(pad_top).div_(scale_h)
+        sc_x = metadata.static_crop_offset.offset_x
+        sc_y = metadata.static_crop_offset.offset_y
+        if sc_x != 0 or sc_y != 0:
+            image_detections[:, 6::3].add_(sc_x)
+            image_detections[:, 7::3].add_(sc_y)
+            image_detections[:, 0:4:2].add_(sc_x)
+            image_detections[:, 1:4:2].add_(sc_y)
     return detections
 
 
