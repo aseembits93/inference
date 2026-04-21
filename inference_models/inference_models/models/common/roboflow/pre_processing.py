@@ -1050,7 +1050,10 @@ def handle_numpy_input_preparation_with_stretch(
         height=image.shape[0], width=image.shape[1]
     )
     resized_image = cv2.resize(image, (target_size.width, target_size.height))
-    tensor = torch.from_numpy(resized_image).to(device=target_device)
+    tensor = torch.from_numpy(resized_image)
+    if target_device.type == "cuda" and not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    tensor = tensor.to(device=target_device, non_blocking=True)
     tensor = torch.unsqueeze(tensor, 0)
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
@@ -1102,7 +1105,10 @@ def handle_numpy_input_preparation_with_letterbox(
     pad_top = int((target_size.height - new_height) / 2)
     pad_left = int((target_size.width - new_width) / 2)
     scaled_image = cv2.resize(image, (new_width, new_height))
-    scaled_image_tensor = torch.from_numpy(scaled_image).to(target_device)
+    scaled_image_tensor = torch.from_numpy(scaled_image)
+    if target_device.type == "cuda" and not scaled_image_tensor.is_pinned():
+        scaled_image_tensor = scaled_image_tensor.pin_memory()
+    scaled_image_tensor = scaled_image_tensor.to(target_device, non_blocking=True)
     scaled_image_tensor = scaled_image_tensor.permute(2, 0, 1)
     final_batch = torch.full(
         (
@@ -1208,7 +1214,10 @@ def handle_numpy_input_preparation_with_center_crop(
         scale_height=1.0,
         static_crop_offset=static_crop_offset,
     )
-    tensor = torch.from_numpy(canvas).to(device=target_device)
+    tensor = torch.from_numpy(canvas)
+    if target_device.type == "cuda" and not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    tensor = tensor.to(device=target_device, non_blocking=True)
     tensor = torch.unsqueeze(tensor, 0)
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
@@ -1266,7 +1275,10 @@ def handle_numpy_input_preparation_fitting_longer_edge(
         scale_height=actual_target_size.height / size_after_pre_processing.height,
         static_crop_offset=static_crop_offset,
     )
-    tensor = torch.from_numpy(scaled_image).to(device=target_device)
+    tensor = torch.from_numpy(scaled_image)
+    if target_device.type == "cuda" and not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    tensor = tensor.to(device=target_device, non_blocking=True)
     tensor = torch.unsqueeze(tensor, 0)
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
