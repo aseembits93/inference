@@ -52,44 +52,39 @@ def post_process_instance_segmentation_results(
 ) -> List[InstanceDetections]:
     logits_sigmoid = torch.nn.functional.sigmoid(logits)
     results = []
-    device = bboxes.device
     for image_bboxes, image_logits, image_masks, image_meta in zip(
         bboxes, logits_sigmoid, masks, pre_processing_meta
     ):
         confidence, top_classes = image_logits.max(dim=1)
         confidence_mask = confidence > threshold
-        confidence = confidence[confidence_mask]
-        top_classes = top_classes[confidence_mask]
-        selected_boxes = image_bboxes[confidence_mask]
-        selected_masks = image_masks[confidence_mask]
+        # Share one ``nonzero`` across the four filtered tensors; boolean
+        # advanced indexing ran ``nonzero`` internally four times.
+        conf_idx = confidence_mask.nonzero(as_tuple=True)[0]
+        confidence = confidence.index_select(0, conf_idx)
+        top_classes = top_classes.index_select(0, conf_idx)
+        selected_boxes = image_bboxes.index_select(0, conf_idx)
+        selected_masks = image_masks.index_select(0, conf_idx)
         confidence, sorted_indices = torch.sort(confidence, descending=True)
-        top_classes = top_classes[sorted_indices]
-        selected_boxes = selected_boxes[sorted_indices]
-        selected_masks = selected_masks[sorted_indices]
+        top_classes = top_classes.index_select(0, sorted_indices)
+        selected_boxes = selected_boxes.index_select(0, sorted_indices)
+        selected_masks = selected_masks.index_select(0, sorted_indices)
         if classes_re_mapping is not None:
             remapping_mask = torch.isin(
                 top_classes, classes_re_mapping.remaining_class_ids
             )
-            top_classes = classes_re_mapping.class_mapping[top_classes[remapping_mask]]
-            selected_boxes = selected_boxes[remapping_mask]
-            confidence = confidence[remapping_mask]
-            selected_masks = selected_masks[remapping_mask]
+            rem_idx = remapping_mask.nonzero(as_tuple=True)[0]
+            top_classes_kept = top_classes.index_select(0, rem_idx)
+            top_classes = classes_re_mapping.class_mapping[top_classes_kept]
+            selected_boxes = selected_boxes.index_select(0, rem_idx)
+            confidence = confidence.index_select(0, rem_idx)
+            selected_masks = selected_masks.index_select(0, rem_idx)
         cxcy = selected_boxes[:, :2]
         wh = selected_boxes[:, 2:]
         xy_min = cxcy - 0.5 * wh
         xy_max = cxcy + 0.5 * wh
-        selected_boxes_xyxy_pct = torch.cat([xy_min, xy_max], dim=-1)
+        selected_boxes_xyxy = torch.cat([xy_min, xy_max], dim=-1)
         denorm_size = (
             image_meta.nonsquare_intermediate_size or image_meta.inference_size
-        )
-        denorm_size_whwh = torch.tensor(
-            [
-                denorm_size.width,
-                denorm_size.height,
-                denorm_size.width,
-                denorm_size.height,
-            ],
-            device=device,
         )
         padding = (
             image_meta.pad_left,
@@ -97,7 +92,10 @@ def post_process_instance_segmentation_results(
             image_meta.pad_right,
             image_meta.pad_bottom,
         )
-        selected_boxes_xyxy = selected_boxes_xyxy_pct * denorm_size_whwh
+        # Scale by width/height via in-place strided mul_ instead of
+        # constructing a 4-element CUDA tensor per call.
+        selected_boxes_xyxy[:, 0::2].mul_(denorm_size.width)
+        selected_boxes_xyxy[:, 1::2].mul_(denorm_size.height)
         aligned_boxes, aligned_masks = align_instance_segmentation_results(
             image_bboxes=selected_boxes_xyxy,
             masks=selected_masks,

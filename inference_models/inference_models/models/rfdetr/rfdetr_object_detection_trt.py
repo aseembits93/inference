@@ -273,41 +273,43 @@ class RFDetrForObjectDetectionTRT(
             ):
                 predicted_confidence, top_classes = image_logits.max(dim=1)
                 confidence_mask = predicted_confidence > confidence
-                predicted_confidence = predicted_confidence[confidence_mask]
-                top_classes = top_classes[confidence_mask]
-                selected_boxes = image_bboxes[confidence_mask]
+                # Share one ``nonzero`` across the three filtered tensors; the
+                # boolean-indexing shorthand ran ``nonzero`` three times.
+                conf_idx = confidence_mask.nonzero(as_tuple=True)[0]
+                predicted_confidence = predicted_confidence.index_select(0, conf_idx)
+                top_classes = top_classes.index_select(0, conf_idx)
+                selected_boxes = image_bboxes.index_select(0, conf_idx)
                 predicted_confidence, sorted_indices = torch.sort(
                     predicted_confidence, descending=True
                 )
-                top_classes = top_classes[sorted_indices]
-                selected_boxes = selected_boxes[sorted_indices]
+                top_classes = top_classes.index_select(0, sorted_indices)
+                selected_boxes = selected_boxes.index_select(0, sorted_indices)
                 if self._classes_re_mapping is not None:
                     remapping_mask = torch.isin(
                         top_classes, self._classes_re_mapping.remaining_class_ids
                     )
+                    rem_idx = remapping_mask.nonzero(as_tuple=True)[0]
+                    # Remap classes using the mapping table, but on the
+                    # already-filtered tensor to avoid three separate
+                    # boolean indexings.
+                    top_classes_kept = top_classes.index_select(0, rem_idx)
                     top_classes = self._classes_re_mapping.class_mapping[
-                        top_classes[remapping_mask]
+                        top_classes_kept
                     ]
-                    selected_boxes = selected_boxes[remapping_mask]
-                    predicted_confidence = predicted_confidence[remapping_mask]
+                    selected_boxes = selected_boxes.index_select(0, rem_idx)
+                    predicted_confidence = predicted_confidence.index_select(0, rem_idx)
                 cxcy = selected_boxes[:, :2]
                 wh = selected_boxes[:, 2:]
                 xy_min = cxcy - 0.5 * wh
                 xy_max = cxcy + 0.5 * wh
-                selected_boxes_xyxy_pct = torch.cat([xy_min, xy_max], dim=-1)
+                selected_boxes_xyxy = torch.cat([xy_min, xy_max], dim=-1)
                 denorm_size = (
                     image_meta.nonsquare_intermediate_size or image_meta.inference_size
                 )
-                inference_size_whwh = torch.tensor(
-                    [
-                        denorm_size.width,
-                        denorm_size.height,
-                        denorm_size.width,
-                        denorm_size.height,
-                    ],
-                    device=self._device,
-                )
-                selected_boxes_xyxy = selected_boxes_xyxy_pct * inference_size_whwh
+                # Scale by width/height using in-place scalar mul_ on strided
+                # views; avoids allocating a 4-element CUDA tensor per call.
+                selected_boxes_xyxy[:, 0::2].mul_(denorm_size.width)
+                selected_boxes_xyxy[:, 1::2].mul_(denorm_size.height)
                 selected_boxes_xyxy = rescale_image_detections(
                     image_detections=selected_boxes_xyxy,
                     image_metadata=image_meta,
