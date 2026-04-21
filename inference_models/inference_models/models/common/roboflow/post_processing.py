@@ -194,44 +194,23 @@ def rescale_image_detections(
     image_detections: torch.Tensor,
     image_metadata: PreProcessingMetadata,
 ) -> torch.Tensor:
-    # in-place processing
-    offsets = torch.as_tensor(
-        [
-            image_metadata.pad_left,
-            image_metadata.pad_top,
-            image_metadata.pad_left,
-            image_metadata.pad_top,
-        ],
-        dtype=image_detections.dtype,
-        device=image_detections.device,
+    # in-place processing — operate with Python scalars on strided views of
+    # the xyxy columns so we avoid allocating small per-call CUDA tensors
+    # (each ``torch.as_tensor([...], device='cuda')`` is an H2D transfer
+    # plus a tensor allocation). The x-coords (columns 0 and 2) share the
+    # same pad/scale, as do the y-coords (columns 1 and 3).
+    image_detections[:, 0:4:2].sub_(image_metadata.pad_left).div_(
+        image_metadata.scale_width
     )
-    image_detections[:, :4].sub_(offsets)  # in-place subtraction for speed/memory
-    scale = torch.as_tensor(
-        [
-            image_metadata.scale_width,
-            image_metadata.scale_height,
-            image_metadata.scale_width,
-            image_metadata.scale_height,
-        ],
-        dtype=image_detections.dtype,
-        device=image_detections.device,
+    image_detections[:, 1:4:2].sub_(image_metadata.pad_top).div_(
+        image_metadata.scale_height
     )
-    image_detections[:, :4].div_(scale)
     if (
         image_metadata.static_crop_offset.offset_x != 0
         or image_metadata.static_crop_offset.offset_y != 0
     ):
-        static_crop_offsets = torch.as_tensor(
-            [
-                image_metadata.static_crop_offset.offset_x,
-                image_metadata.static_crop_offset.offset_y,
-                image_metadata.static_crop_offset.offset_x,
-                image_metadata.static_crop_offset.offset_y,
-            ],
-            dtype=image_detections.dtype,
-            device=image_detections.device,
-        )
-        image_detections[:, :4].add_(static_crop_offsets)
+        image_detections[:, 0:4:2].add_(image_metadata.static_crop_offset.offset_x)
+        image_detections[:, 1:4:2].add_(image_metadata.static_crop_offset.offset_y)
     return image_detections
 
 
