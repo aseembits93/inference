@@ -1,0 +1,2 @@
+experiment	status	pattern	target	before	after	improvement	timestamp	commit
+baseline	baseline	-	rfdetr-base.infer()	3.83ms	-	-	2026-04-21T00:00:00	-

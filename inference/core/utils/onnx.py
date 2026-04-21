@@ -42,24 +42,27 @@ def run_session_via_iobinding(
         predictions = session.run(None, {input_name: input_data})
     else:
         # we live on GPU and we can use CUDA ONNX, so point to the input data directly
+        import torch
         binding = session.io_binding()
 
-        predictions = []
+        gpu_predictions = []
         dtype = None
         for output in session.get_outputs():
-            # assemble numpy-based output buffers for the ONNX runtime to write to
+            # assemble GPU-based output buffers for the ONNX runtime to write to directly
             if dtype is None:
                 dtype = np.float16 if "16" in output.type else np.float32
-            prediction = np.empty(output.shape, dtype=dtype)
+            torch_dtype = torch.float16 if dtype == np.float16 else torch.float32
+            # Allocate output tensor on GPU
+            prediction_tensor = torch.empty(output.shape, dtype=torch_dtype, device=input_data.device)
             binding.bind_output(
                 name=output.name,
-                device_type="cpu",
-                device_id=0,
+                device_type=input_data.device.type,
+                device_id=(input_data.device.index if input_data.device.index is not None else 0),
                 element_type=dtype,
                 shape=output.shape,
-                buffer_ptr=prediction.ctypes.data,
+                buffer_ptr=prediction_tensor.data_ptr(),
             )
-            predictions.append(prediction)
+            gpu_predictions.append(prediction_tensor)
 
         input_data = input_data.contiguous()
         binding.bind_input(
@@ -73,11 +76,11 @@ def run_session_via_iobinding(
             buffer_ptr=input_data.data_ptr(),
         )
 
-        binding.synchronize_inputs()
-
         session.run_with_iobinding(binding)
 
-        # convert the output buffers to float32 as we may run mixed precision inference in the future
-        predictions = [prediction.astype(np.float32) for prediction in predictions]
+        # Convert GPU tensors to numpy on CPU only when needed
+        # Keep as float16 if that's what the model outputs to avoid extra conversion
+        predictions = [pred.cpu().numpy().astype(np.float32) if pred.dtype == torch.float16
+                       else pred.cpu().numpy() for pred in gpu_predictions]
 
     return predictions

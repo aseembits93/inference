@@ -73,6 +73,12 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
     preprocess_means = [0.485, 0.456, 0.406]
     preprocess_stds = [0.229, 0.224, 0.225]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Pre-create normalization tensors (will be moved to GPU on first use)
+        self._preproc_means_tensor = None
+        self._preproc_stds_tensor = None
+
     @property
     def weights_file(self) -> str:
         """Gets the weights file for the RFDETR model.
@@ -105,7 +111,11 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         """
         if isinstance(image, Image.Image) and USE_PYTORCH_FOR_PREPROCESSING:
             if CUDA_IS_AVAILABLE:
-                np_image = torch.from_numpy(np.asarray(image, copy=False)).cuda()
+                # Use pinned memory for faster H2D transfer
+                np_image = torch.from_numpy(np.asarray(image, copy=False))
+                if not np_image.is_pinned():
+                    np_image = np_image.pin_memory()
+                np_image = np_image.cuda(non_blocking=True)
             else:
                 np_image = torch.from_numpy(np.asarray(image, copy=False))
             is_bgr = False
@@ -119,8 +129,10 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         if USE_PYTORCH_FOR_PREPROCESSING:
             if not isinstance(np_image, torch.Tensor):
                 np_image = torch.from_numpy(np_image)
+                if torch.cuda.is_available() and not np_image.is_pinned():
+                    np_image = np_image.pin_memory()
             if torch.cuda.is_available():
-                np_image = np_image.cuda()
+                np_image = np_image.cuda(non_blocking=True)
 
         preprocessed_image, img_dims = self.preprocess_image(
             np_image,
@@ -137,13 +149,16 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
 
             preprocessed_image /= 255.0
 
-            means = torch.tensor(
-                self.preprocess_means, device=preprocessed_image.device
-            ).view(3, 1, 1)
-            stds = torch.tensor(
-                self.preprocess_stds, device=preprocessed_image.device
-            ).view(3, 1, 1)
-            preprocessed_image = (preprocessed_image - means) / stds
+            # Create normalization tensors once on the correct device
+            if self._preproc_means_tensor is None or self._preproc_means_tensor.device != preprocessed_image.device:
+                self._preproc_means_tensor = torch.tensor(
+                    self.preprocess_means, device=preprocessed_image.device, dtype=torch.float32
+                ).view(3, 1, 1)
+                self._preproc_stds_tensor = torch.tensor(
+                    self.preprocess_stds, device=preprocessed_image.device, dtype=torch.float32
+                ).view(3, 1, 1)
+
+            preprocessed_image = (preprocessed_image - self._preproc_means_tensor) / self._preproc_stds_tensor
         else:
             preprocessed_image = preprocessed_image.astype(np.float32)
             preprocessed_image /= 255.0
