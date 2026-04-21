@@ -53,15 +53,17 @@ def run_nms_for_object_detection(
         keep = torchvision.ops.batched_nms(xyxy, class_conf, nms_class_ids, iou_thresh)
         if keep.numel() > max_detections:
             keep = keep[:max_detections]
-        detections = torch.cat(
+        # Concatenate [xyxy | conf | cls] once and gather with a single
+        # ``index_select`` rather than three separate ``[keep]`` indexings.
+        packed = torch.cat(
             (
-                xyxy[keep],
-                class_conf[keep, None],  # unsqueeze(1) is replaced with None
-                class_ids[keep, None].float(),
+                xyxy,
+                class_conf.unsqueeze(1),
+                class_ids.unsqueeze(1).float(),
             ),
             1,
-        )  # [x1, y1, x2, y2, conf, cls]
-
+        )  # (num, 6) — [x1, y1, x2, y2, conf, cls]
+        detections = packed.index_select(0, keep)
         results.append(detections)
     return results
 
@@ -122,15 +124,18 @@ def run_nms_for_instance_segmentation(
         nms_class_ids = torch.zeros_like(class_ids) if class_agnostic else class_ids
         keep = torchvision.ops.batched_nms(xyxy, class_conf, nms_class_ids, iou_thresh)
         keep = keep[:max_detections]
-        detections = torch.cat(
+        # Pre-concatenate and do a single index_select rather than four
+        # separate ``[keep]`` indexings.
+        packed = torch.cat(
             [
-                xyxy[keep],
-                class_conf[keep].unsqueeze(1),
-                class_ids[keep].unsqueeze(1).float(),
-                box_masks[keep],
+                xyxy,
+                class_conf.unsqueeze(1),
+                class_ids.unsqueeze(1).float(),
+                box_masks,
             ],
             dim=1,
-        )  # [x1, y1, x2, y2, conf, cls]
+        )  # [x1, y1, x2, y2, conf, cls, mask_coeffs(32)]
+        detections = packed.index_select(0, keep)
         results.append(detections)
     return results
 
@@ -176,15 +181,18 @@ def run_nms_for_key_points_detection(
         keep = torchvision.ops.batched_nms(xyxy, class_conf, nms_class_ids, iou_thresh)
         if keep.numel() > max_detections:
             keep = keep[:max_detections]
-        detections = torch.cat(
+        # Pre-concatenate and do a single index_select rather than four
+        # separate ``[keep]`` indexings.
+        packed = torch.cat(
             (
-                xyxy[keep],
-                class_conf[keep, None],  # unsqueeze(1) is replaced with None
-                class_ids[keep, None].float(),
-                image_key_points[keep],
+                xyxy,
+                class_conf.unsqueeze(1),
+                class_ids.unsqueeze(1).float(),
+                image_key_points,
             ),
             1,
         )  # [x1, y1, x2, y2, conf, cls, keypoints....]
+        detections = packed.index_select(0, keep)
         results.append(detections)
     return results
 
