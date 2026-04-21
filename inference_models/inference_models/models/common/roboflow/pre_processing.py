@@ -1,4 +1,5 @@
 import math
+import threading
 from typing import List, Optional, Tuple, Union
 
 import cv2
@@ -25,6 +26,60 @@ from inference_models.models.common.roboflow.model_packages import (
     StaticCrop,
     StaticCropOffset,
 )
+
+# Thread-local cache of pre-allocated pinned host staging buffers keyed by
+# (shape, dtype). Using per-thread caches avoids cross-thread contention and
+# keeps the buffer reusable across successive inference calls with the same
+# input geometry. Pre-allocating amortizes the ~50us cost of pinning new host
+# memory on every call, which dominates the preprocess CPU time for small TRT
+# models (YOLOv8n/YOLOv8-seg).
+_pinned_buffer_cache = threading.local()
+
+
+def _get_pinned_staging_buffer(
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a cached pinned host tensor matching ``shape``/``dtype``.
+
+    The cache is per-thread so concurrent inference callers do not contend.
+    The tensor is reused across calls until its shape or dtype changes, so
+    the usual per-call ``pin_memory()`` (which both allocates and pins) is
+    replaced by a cheap ``copy_()`` into an already-pinned buffer.
+    """
+    cache = getattr(_pinned_buffer_cache, "buffers", None)
+    if cache is None:
+        cache = {}
+        _pinned_buffer_cache.buffers = cache
+    key = (shape, dtype)
+    buf = cache.get(key)
+    if buf is None:
+        buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+        cache[key] = buf
+    return buf
+
+
+def _numpy_to_device_via_pinned_buffer(
+    image: np.ndarray,
+    target_device: torch.device,
+) -> torch.Tensor:
+    """Copy ``image`` to ``target_device`` via a cached pinned staging buffer.
+
+    For CUDA devices this is faster than the ``torch.from_numpy(x).pin_memory()``
+    idiom because ``pin_memory()`` allocates and pins fresh host memory on every
+    call. The cached buffer is pinned once and reused for all subsequent calls
+    with the same ``(shape, dtype)``.
+
+    For non-CUDA targets the function falls back to ``torch.from_numpy(...).to``
+    without any pinning work.
+    """
+    if target_device.type != "cuda":
+        return torch.from_numpy(image).to(target_device)
+    # numpy_dtype -> torch_dtype mapping is handled by torch.from_numpy
+    src_tensor = torch.from_numpy(image)
+    buf = _get_pinned_staging_buffer(tuple(image.shape), src_tensor.dtype)
+    buf.copy_(src_tensor)
+    return buf.to(target_device, non_blocking=True)
 
 
 def pre_process_network_input(
@@ -1050,10 +1105,7 @@ def handle_numpy_input_preparation_with_stretch(
         height=image.shape[0], width=image.shape[1]
     )
     resized_image = cv2.resize(image, (target_size.width, target_size.height))
-    tensor = torch.from_numpy(resized_image)
-    if target_device.type == "cuda" and not tensor.is_pinned():
-        tensor = tensor.pin_memory()
-    tensor = tensor.to(device=target_device, non_blocking=True)
+    tensor = _numpy_to_device_via_pinned_buffer(resized_image, target_device)
     tensor = torch.unsqueeze(tensor, 0)
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
@@ -1105,10 +1157,9 @@ def handle_numpy_input_preparation_with_letterbox(
     pad_top = int((target_size.height - new_height) / 2)
     pad_left = int((target_size.width - new_width) / 2)
     scaled_image = cv2.resize(image, (new_width, new_height))
-    scaled_image_tensor = torch.from_numpy(scaled_image)
-    if target_device.type == "cuda" and not scaled_image_tensor.is_pinned():
-        scaled_image_tensor = scaled_image_tensor.pin_memory()
-    scaled_image_tensor = scaled_image_tensor.to(target_device, non_blocking=True)
+    scaled_image_tensor = _numpy_to_device_via_pinned_buffer(
+        scaled_image, target_device
+    )
     scaled_image_tensor = scaled_image_tensor.permute(2, 0, 1)
     final_batch = torch.full(
         (
@@ -1214,10 +1265,7 @@ def handle_numpy_input_preparation_with_center_crop(
         scale_height=1.0,
         static_crop_offset=static_crop_offset,
     )
-    tensor = torch.from_numpy(canvas)
-    if target_device.type == "cuda" and not tensor.is_pinned():
-        tensor = tensor.pin_memory()
-    tensor = tensor.to(device=target_device, non_blocking=True)
+    tensor = _numpy_to_device_via_pinned_buffer(canvas, target_device)
     tensor = torch.unsqueeze(tensor, 0)
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
@@ -1275,10 +1323,7 @@ def handle_numpy_input_preparation_fitting_longer_edge(
         scale_height=actual_target_size.height / size_after_pre_processing.height,
         static_crop_offset=static_crop_offset,
     )
-    tensor = torch.from_numpy(scaled_image)
-    if target_device.type == "cuda" and not tensor.is_pinned():
-        tensor = tensor.pin_memory()
-    tensor = tensor.to(device=target_device, non_blocking=True)
+    tensor = _numpy_to_device_via_pinned_buffer(scaled_image, target_device)
     tensor = torch.unsqueeze(tensor, 0)
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
