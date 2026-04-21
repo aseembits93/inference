@@ -37,6 +37,21 @@ def run_python_package_speed_benchmark(
         f"Model details | task_type={model_type[0]} | model_type={model_type[1]} | "
         f"batch_size={model_batch_size} | input_height={input_height} | input_width={input_width}"
     )
+
+    uses_tensorrt = False
+    if hasattr(model, "model") and hasattr(model.model, "_session"):
+        if hasattr(model.model._session, "get_providers"):
+            providers = model.model._session.get_providers()
+            uses_tensorrt = "TensorrtExecutionProvider" in providers
+            print(f"ONNX Runtime providers: {providers}")
+
+    if uses_tensorrt and warm_up_inferences < 50:
+        print(f"TensorRT detected - increasing warmup from {warm_up_inferences} to 50 iterations for engine optimization")
+        warm_up_inferences = 50
+
+    while len(images) < batch_size:
+        images = images + images
+
     run_model_warm_up(
         model=model,
         inference_configuration=inference_configuration,
@@ -73,16 +88,17 @@ def run_benchmark(
     benchmark_inferences: int,
     batch_size: int,
 ) -> None:
-    while len(images) < batch_size:
-        images = images + images
+    indices = list(range(len(images)))
     results_collector.start_benchmark()
     try:
         for _ in range(benchmark_inferences):
-            random.shuffle(images)
-            payload = images[:batch_size]
-            start = time.time()
+            random.shuffle(indices)
+            payload = [images[i] for i in indices[:batch_size]]
+
+            start = time.perf_counter()
             _ = model.infer(payload, **inference_configuration)
-            duration = time.time() - start
+            duration = time.perf_counter() - start
+
             results_collector.register_inference_duration(
                 batch_size=batch_size, duration=duration
             )

@@ -1,6 +1,9 @@
+import hashlib
 import os.path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from glob import glob
 from itertools import chain
+from pathlib import Path
 from typing import List, Optional
 
 import cv2
@@ -14,6 +17,7 @@ from inference_sdk.http.utils.encoding import bytes_to_opencv_image
 
 MAX_IMAGES_TO_LOAD = 8
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png"]
+CACHE_DIR = Path.home() / ".cache" / "inference_cli" / "benchmark_images"
 PREDEFINED_DATASETS = {
     "coco": [
         "https://source.roboflow.com/BTRTpB7nxxjUchrOQ9vT/aFq7tthQAK6d4pvtupX7/original.jpg",
@@ -69,18 +73,40 @@ def load_image(path: str) -> Optional[np.ndarray]:
 
 
 def download_images(urls: List[str]) -> List[np.ndarray]:
-    results = [download_image(url=url) for url in tqdm(urls, "Loading images...")]
-    non_empty_results = [r for r in results if r is not None]
-    if len(non_empty_results) < 1:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_url = {executor.submit(download_image, url): url for url in urls}
+
+        with tqdm(total=len(urls), desc="Loading images...") as pbar:
+            for future in as_completed(future_to_url):
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+                pbar.update(1)
+
+    if len(results) < 1:
         raise DatasetLoadingError(f"Could not load images")
-    return non_empty_results
+    return results
 
 
 def download_image(url: str) -> Optional[np.ndarray]:
     try:
-        response = requests.get(url)
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        cache_path = CACHE_DIR / f"{url_hash}.jpg"
+
+        if cache_path.exists():
+            return cv2.imread(str(cache_path))
+
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
-        return bytes_to_opencv_image(payload=response.content)
+        image = bytes_to_opencv_image(payload=response.content)
+
+        if image is not None:
+            cv2.imwrite(str(cache_path), image)
+
+        return image
     except Exception as error:
         CLI_LOGGER.warning(f"Could not load image: {url}. Cause: {error}")
         return None

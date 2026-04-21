@@ -1,7 +1,7 @@
+import time
 from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -47,17 +47,21 @@ class InferenceStatistics:
 
 class ResultsCollector:
 
-    def __init__(self):
-        self._benchmark_start: Optional[datetime] = None
-        self._inference_details: List[
-            Tuple[datetime, int, float, Optional[float], Optional[float]]
-        ] = []
-        self._benchmark_end: Optional[datetime] = None
-        self._errors: List[Tuple[datetime, int, str]] = []
+    def __init__(self, preallocate_size: int = 10000):
+        self._benchmark_start: Optional[float] = None
+        self._preallocate_size = preallocate_size
+        self._timestamps = np.zeros(preallocate_size, dtype=np.float64)
+        self._batch_sizes = np.zeros(preallocate_size, dtype=np.int32)
+        self._durations = np.zeros(preallocate_size, dtype=np.float32)
+        self._execution_times = np.full(preallocate_size, np.nan, dtype=np.float32)
+        self._remote_execution_times = np.full(preallocate_size, np.nan, dtype=np.float32)
+        self._current_index = 0
+        self._benchmark_end: Optional[float] = None
+        self._errors: List[Tuple[float, int, str]] = []
 
     def start_benchmark(self) -> None:
         if self._benchmark_start is None:
-            self._benchmark_start = datetime.now()
+            self._benchmark_start = time.perf_counter()
 
     def register_inference_duration(
         self,
@@ -66,22 +70,33 @@ class ResultsCollector:
         execution_time: Optional[float] = None,
         remote_execution_time: Optional[float] = None,
     ) -> None:
-        self._inference_details.append(
-            (
-                datetime.now(),
-                batch_size,
-                duration,
-                execution_time,
-                remote_execution_time,
-            )
-        )
+        if self._current_index >= self._preallocate_size:
+            new_size = self._preallocate_size * 2
+            self._timestamps = np.resize(self._timestamps, new_size)
+            self._batch_sizes = np.resize(self._batch_sizes, new_size)
+            self._durations = np.resize(self._durations, new_size)
+            self._execution_times = np.resize(self._execution_times, new_size)
+            self._remote_execution_times = np.resize(self._remote_execution_times, new_size)
+            self._execution_times[self._preallocate_size:] = np.nan
+            self._remote_execution_times[self._preallocate_size:] = np.nan
+            self._preallocate_size = new_size
+
+        idx = self._current_index
+        self._timestamps[idx] = time.perf_counter()
+        self._batch_sizes[idx] = batch_size
+        self._durations[idx] = duration
+        if execution_time is not None:
+            self._execution_times[idx] = execution_time
+        if remote_execution_time is not None:
+            self._remote_execution_times[idx] = remote_execution_time
+        self._current_index += 1
 
     def register_error(self, batch_size: int, status_code: str) -> None:
-        self._errors.append((datetime.now(), batch_size, status_code))
+        self._errors.append((time.perf_counter(), batch_size, status_code))
 
     def stop_benchmark(self) -> None:
         if self._benchmark_end is None:
-            self._benchmark_end = datetime.now()
+            self._benchmark_end = time.perf_counter()
 
     def has_benchmark_finished(self) -> bool:
         return self._benchmark_end is not None
@@ -89,64 +104,74 @@ class ResultsCollector:
     def get_statistics(
         self, window: Optional[int] = None
     ) -> Optional[InferenceStatistics]:
-        if self._benchmark_start is None or len(self._inference_details) < 1:
+        if self._benchmark_start is None or self._current_index < 1:
             return None
         end_time = (
-            self._benchmark_end if self._benchmark_end is not None else datetime.now()
+            self._benchmark_end if self._benchmark_end is not None else time.perf_counter()
         )
-        stats = copy(
-            self._inference_details
-        )  # to have it stable in multi-threading env
-        errors = copy(self._errors)
+
+        n = self._current_index
         if window is not None:
-            stats = stats[-window:]
-        latencies = [s[2] for s in stats]
-        execution_times = [s[3] for s in stats if s[3] is not None]
-        remote_execution_times = [s[4] for s in stats if s[4] is not None]
-        inferences_made = len(stats)
-        images_processed = sum(s[1] for s in stats)
-        average_inference_latency_ms = round(np.average(latencies) * 1000, 1)
-        if execution_times:
-            average_execution_time_ms = round(np.average(execution_times) * 1000, 1)
+            start_idx = max(0, n - window)
+        else:
+            start_idx = 0
+
+        timestamps = self._timestamps[start_idx:n]
+        batch_sizes = self._batch_sizes[start_idx:n]
+        durations = self._durations[start_idx:n]
+        execution_times = self._execution_times[start_idx:n]
+        remote_execution_times = self._remote_execution_times[start_idx:n]
+
+        inferences_made = n - start_idx
+        images_processed = int(np.sum(batch_sizes))
+
+        average_inference_latency_ms = round(float(np.mean(durations)) * 1000, 1)
+
+        valid_exec_times = execution_times[~np.isnan(execution_times)]
+        if len(valid_exec_times) > 0:
+            average_execution_time_ms = round(float(np.mean(valid_exec_times)) * 1000, 1)
             average_execution_time_per_image_ms = round(
                 average_execution_time_ms * inferences_made / images_processed, 2
             )
         else:
             average_execution_time_ms = None
             average_execution_time_per_image_ms = None
-        if remote_execution_times:
-            avg_remote_execution_time = sum(remote_execution_times) / len(
-                remote_execution_times
-            )
+
+        valid_remote_times = remote_execution_times[~np.isnan(remote_execution_times)]
+        if len(valid_remote_times) > 0:
+            avg_remote_execution_time = float(np.mean(valid_remote_times))
         else:
             avg_remote_execution_time = None
-        std_inference_latency_ms = round(np.std(latencies) * 1000, 1)
+
+        std_inference_latency_ms = round(float(np.std(durations)) * 1000, 1)
         average_inference_latency_per_image_ms = round(
             average_inference_latency_ms * inferences_made / images_processed, 2
         )
-        p50_inference_latency_ms = round(np.percentile(latencies, 50) * 1000, 1)
-        p75_inference_latency_ms = round(np.percentile(latencies, 75) * 1000, 1)
-        p90_inference_latency_ms = round(np.percentile(latencies, 90) * 1000, 1)
-        p95_inference_latency_ms = round(np.percentile(latencies, 95) * 1000, 1)
-        p99_inference_latency_ms = round(np.percentile(latencies, 99) * 1000, 1)
-        start = (
+        p50_inference_latency_ms = round(float(np.percentile(durations, 50)) * 1000, 1)
+        p75_inference_latency_ms = round(float(np.percentile(durations, 75)) * 1000, 1)
+        p90_inference_latency_ms = round(float(np.percentile(durations, 90)) * 1000, 1)
+        p95_inference_latency_ms = round(float(np.percentile(durations, 95)) * 1000, 1)
+        p99_inference_latency_ms = round(float(np.percentile(durations, 99)) * 1000, 1)
+
+        start_time = (
             self._benchmark_start
-            if window is None or len(stats) < window
-            else stats[0][0]
+            if window is None or inferences_made < window
+            else timestamps[0]
         )
 
+        errors = copy(self._errors)
         error_status_codes = defaultdict(int)
         errors_number = 0
         for e in errors:
-            if e[0] < start:
+            if e[0] < start_time:
                 continue
             error_status_codes[e[2]] += 1
             errors_number += 1
 
-        error_rate = round(errors_number / inferences_made * 100, 2)
-        duration = (end_time - start).total_seconds()
-        requests_per_second = round(inferences_made / duration, 1)
-        images_per_second = round(images_processed / duration, 1)
+        error_rate = round(errors_number / inferences_made * 100, 2) if inferences_made > 0 else 0.0
+        duration = end_time - start_time
+        requests_per_second = round(inferences_made / duration, 1) if duration > 0 else 0.0
+        images_per_second = round(images_processed / duration, 1) if duration > 0 else 0.0
         return InferenceStatistics(
             inferences_made=inferences_made,
             images_processed=images_processed,
