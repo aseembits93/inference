@@ -23,3 +23,4 @@ final-rfdetr-base	measurement	-	rfdetr-base.infer() single	3.877ms±0.183ms	3.55
 final-yolov8n-b8	measurement	-	yolov8n-640.infer() batch=8	14.251ms	13.084ms	+8.2% batch	2026-04-21T21:30:00	3c710460b
 final-yolov8n-seg-b8	measurement	-	yolov8n-seg-640.infer() batch=8	36.721ms (median 27.9)	33.209ms (median 26.5)	+5.0% batch (median)	2026-04-21T21:30:00	3c710460b
 final-rfdetr-base-b8	measurement	-	rfdetr-base.infer() batch=8	31.309ms	29.206ms	+6.7% batch	2026-04-21T21:30:00	3c710460b
+sam3-investigation	blocked	-	SAM3 TRT optimization	n/a	n/a	No TRT backend exists; sam3 package not installed	2026-04-21T21:47:32	-

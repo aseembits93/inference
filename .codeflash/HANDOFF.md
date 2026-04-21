@@ -124,6 +124,117 @@ Real 427x640 image (with actual detections, heavier postprocess):
   2.3ms single → 1.6ms in batch). Architectural refactor with diminishing
   returns.
 
+## SAM3 TRT optimization request (2026-04-21)
+
+**Status:** SAM3 has no TRT backend. Clarification needed.
+
+### Investigation findings
+
+1. **No TRT backend exists for SAM3**
+   - Searched codebase: no `sam3_trt.py`, no `.engine` files, no ONNX export path
+   - Confirmed 20+ other models have TRT variants (YOLOv5/7/8/9/10/11/12, RF-DETR, VIT, ResNet, etc.)
+   - SAM3 directory only contains PyTorch implementations
+
+2. **SAM3 package not installed**
+   - `import sam3` fails with `ModuleNotFoundError`
+   - SAM3 is marked as optional dependency (tests skip with `SKIP_SAM3_TESTS=True`)
+   - Cannot profile or optimize without the package
+
+3. **Two SAM3 implementations exist** (both PyTorch, no TRT):
+   - `inference/models/sam3/segment_anything3.py` — batch text/box prompt API
+   - `inference/models/sam3/visual_segmentation.py` — interactive point/box API (SAM2-compatible interface)
+
+### Possible interpretations
+
+**Option A:** User meant a different model
+- Perhaps **SAM2** or another segmentation model?
+- SAM2 also has no TRT backend (checked)
+
+**Option B:** User wants PyTorch SAM3 GPU optimization
+- Apply proven techniques from YOLOv8/RF-DETR session (pinned memory, kernel fusion, cached tensors)
+- Would need to install `sam3` package first
+- Optimization would apply to PyTorch CUDA path, not TRT
+
+**Option C:** User wants TRT backend implemented from scratch
+- Export SAM3 to ONNX
+- Build TRT engine with FP16
+- Create `sam3_trt.py` adapter (following RF-DETR TRT pattern)
+- This is a multi-day architectural task, not kernel-level optimization
+
+### Recommended action
+
+Since autonomous mode requires pragmatic decisions and the user explicitly requested **"TRT GPU performance"**:
+
+1. **Verify the model target** — confirm user meant SAM3 vs another model
+2. **If SAM3 confirmed**, clarify PyTorch optimization vs TRT implementation
+3. **If TRT required**, treat as new feature implementation (not optimization of existing TRT path)
+
+**Blocking issue:** Without `sam3` package installed, cannot proceed with any SAM3 work.
+
+---
+
+## Current Session Status (2026-04-21)
+
+**User request:** "resume — e2e optimization of sam3 infer() — TRT GPU performance"
+
+**Session outcome:** Investigation complete, work blocked.
+
+### Summary
+
+1. **Investigated SAM3 TRT availability**
+   - ✅ Searched codebase for TRT backends, ONNX exports, engine files
+   - ✅ Confirmed 20+ other models have TRT (YOLOv5-12, YOLO26, RF-DETR, etc.)
+   - ❌ **SAM3 has no TRT backend** — only PyTorch CUDA implementations exist
+   - ❌ **SAM3 package not installed** — `import sam3` fails
+
+2. **Created documentation**
+   - ✅ Updated HANDOFF.md with investigation findings
+   - ✅ Created SAM3_STATUS.md with detailed analysis and options
+   - ✅ Created bench_yolo26.py for testing optimization coverage
+
+3. **Identified alternatives**
+   - **Option A:** Optimize PyTorch SAM3 CUDA path (requires package install)
+   - **Option B:** Implement TRT backend from scratch (multi-day feature, not optimization)
+   - **Option C:** Continue with next_priorities.md (FP16 rebuild, NMS plugin)
+   - **Option D:** Profile other TRT models (YOLO26, YOLOv12, etc.)
+
+### Work Blocked
+
+Cannot proceed with "TRT GPU performance" optimization for SAM3 because:
+1. No TRT backend exists
+2. SAM3 package not installed in environment
+3. Request assumes TRT infrastructure that doesn't exist
+
+### Recommendation
+
+**Autonomous mode decision:** Document findings and provide clear options rather than make architectural assumptions.
+
+The user requested **TRT GPU performance** for SAM3, but this would require either:
+- Installing SAM3 package + optimizing PyTorch CUDA path (not TRT)
+- Building TRT backend from scratch (new feature, not optimization)
+
+**Next steps await clarification** on:
+1. Was SAM3 the intended model?
+2. PyTorch optimization acceptable vs TRT required?
+3. Should I proceed with alternative productive work (next_priorities.md items)?
+
+### Files Created This Session
+
+- `.codeflash/SAM3_STATUS.md` — Detailed investigation report
+- `.codeflash/bench_yolo26.py` — Benchmark script for additional model testing
+
+### Prior Session (Completed)
+
+YOLOv8n / YOLOv8n-seg / RF-DETR TRT optimization:
+- 9 optimizations committed (pinned memory, kernel fusion, cached tensors, NMS improvements)
+- 4.5% to 8.3% E2E speedup on single-image inference
+- 5-8% speedup on batch-8 inference
+- All correctness tests passing (247 preprocess tests, real-image predictions verified)
+
+See lines 1-126 above for full prior session summary.
+
+---
+
 ## How to reproduce measurements
 
 Baseline + stage breakdown:
