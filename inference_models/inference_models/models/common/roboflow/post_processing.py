@@ -289,17 +289,10 @@ def align_instance_segmentation_results(
         )
         return image_bboxes, empty_masks
     pad_left, pad_top, pad_right, pad_bottom = padding
-    offsets = torch.tensor(
-        [pad_left, pad_top, pad_left, pad_top],
-        device=image_bboxes.device,
-    )
-    image_bboxes[:, :4].sub_(offsets)
-    scale = torch.as_tensor(
-        [scale_width, scale_height, scale_width, scale_height],
-        dtype=image_bboxes.dtype,
-        device=image_bboxes.device,
-    )
-    image_bboxes[:, :4].div_(scale)
+    # Strided scalar ops avoid allocating small CUDA offset/scale tensors
+    # per call (see rescale_image_detections for the same pattern).
+    image_bboxes[:, 0:4:2].sub_(pad_left).div_(scale_width)
+    image_bboxes[:, 1:4:2].sub_(pad_top).div_(scale_height)
     n, mh, mw = masks.shape
     mask_h_scale = mh / inference_size.height
     mask_w_scale = mw / inference_size.width
@@ -363,16 +356,7 @@ def align_instance_segmentation_results(
             static_crop_offset.offset_y : static_crop_offset.offset_y + masks.shape[1],
             static_crop_offset.offset_x : static_crop_offset.offset_x + masks.shape[2],
         ] = masks
-        static_crop_offsets = torch.as_tensor(
-            [
-                static_crop_offset.offset_x,
-                static_crop_offset.offset_y,
-                static_crop_offset.offset_x,
-                static_crop_offset.offset_y,
-            ],
-            dtype=image_bboxes.dtype,
-            device=image_bboxes.device,
-        )
-        image_bboxes[:, :4].add_(static_crop_offsets)
+        image_bboxes[:, 0:4:2].add_(static_crop_offset.offset_x)
+        image_bboxes[:, 1:4:2].add_(static_crop_offset.offset_y)
         masks = mask_canvas
     return image_bboxes, masks
