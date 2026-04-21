@@ -31,9 +31,14 @@ def run_nms_for_object_detection(
         if not torch.any(mask):
             results.append(torch.zeros((0, 6), device=output.device))
             continue
-        bboxes = boxes[b][:, mask].T  # (num, 4) -- selects and then transposes
-        class_conf = class_conf[mask]
-        class_ids = class_ids[mask]
+        # Share one ``nonzero`` across the three filtered tensors so we pay
+        # the index-materialization cost (and its D2H scalar for size) only
+        # once instead of three times (PyTorch's boolean advanced indexing
+        # runs ``nonzero`` internally per call).
+        idx = mask.nonzero(as_tuple=True)[0]
+        bboxes = boxes[b].index_select(1, idx).T  # (num, 4)
+        class_conf = class_conf.index_select(0, idx)
+        class_ids = class_ids.index_select(0, idx)
         if box_format == "xywh":
             # Vectorized [x, y, w, h] -> [x1, y1, x2, y2]
             xy = bboxes[:, :2]
@@ -99,10 +104,12 @@ def run_nms_for_instance_segmentation(
         if mask.sum() == 0:
             results.append(torch.zeros((0, 38), device=output.device))
             continue
-        bboxes = bboxes[mask]
-        class_conf = class_conf[mask]
-        class_ids = class_ids[mask]
-        box_masks = box_masks[mask]
+        # Share one ``nonzero`` across the four filtered tensors.
+        idx = mask.nonzero(as_tuple=True)[0]
+        bboxes = bboxes.index_select(0, idx)
+        class_conf = class_conf.index_select(0, idx)
+        class_ids = class_ids.index_select(0, idx)
+        box_masks = box_masks.index_select(0, idx)
         if box_format == "xywh":
             # Vectorized [x, y, w, h] -> [x1, y1, x2, y2]
             xy = bboxes[:, :2]
@@ -153,10 +160,12 @@ def run_nms_for_key_points_detection(
                 )
             )
             continue
-        bboxes = boxes[b][:, mask].T
-        image_key_points = key_points[b, :, mask].T
-        class_conf = class_conf[mask]
-        class_ids = class_ids[mask]
+        # Share one ``nonzero`` across the four filtered tensors.
+        idx = mask.nonzero(as_tuple=True)[0]
+        bboxes = boxes[b].index_select(1, idx).T
+        image_key_points = key_points[b].index_select(1, idx).T
+        class_conf = class_conf.index_select(0, idx)
+        class_ids = class_ids.index_select(0, idx)
         xy = bboxes[:, :2]
         wh = bboxes[:, 2:]
         half_wh = wh / 2
