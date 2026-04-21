@@ -35,6 +35,71 @@ from inference_models.models.common.roboflow.model_packages import (
 # models (YOLOv8n/YOLOv8-seg).
 _pinned_buffer_cache = threading.local()
 
+# Thread-local cache of per-channel mean/std tensors for normalization.
+# The legacy ``functional.normalize`` call accepted Python lists and rebuilt
+# the ``(C, 1, 1)`` mean/std tensors on every call — each rebuild is a fresh
+# small H2D transfer and allocation. We keep the same ``(x - mean) / std``
+# arithmetic (preserving bit-for-bit FP32 rounding that the existing unit
+# tests rely on) but cache the broadcast tensors so a given model config
+# reuses them across calls.
+_normalize_constants_cache = threading.local()
+
+
+def _get_normalize_constants(
+    mean: Tuple[float, ...],
+    std: Tuple[float, ...],
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(mean, std)`` as cached ``(1, C, 1, 1)`` broadcast tensors.
+
+    Cache key is ``(mean, std, device, dtype)`` so the same model
+    always reuses the same device tensors, avoiding the per-call H2D
+    transfer + allocation of ``torch.tensor([...], device='cuda')``.
+    """
+    key = (tuple(mean), tuple(std), device, dtype)
+    cache = getattr(_normalize_constants_cache, "constants", None)
+    if cache is None:
+        cache = {}
+        _normalize_constants_cache.constants = cache
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    mean_t = torch.tensor(mean, dtype=dtype, device=device).view(1, -1, 1, 1)
+    std_t = torch.tensor(std, dtype=dtype, device=device).view(1, -1, 1, 1)
+    cache[key] = (mean_t, std_t)
+    return mean_t, std_t
+
+
+def _maybe_apply_scale_and_normalize(
+    tensor: torch.Tensor,
+    scaling_factor: Optional[float],
+    normalization: Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]],
+) -> torch.Tensor:
+    """Apply ``(x / scaling_factor - mean) / std`` preserving the exact
+    floating-point sequence the legacy code used.
+
+    We keep the three-step arithmetic (``/ scale``, ``- mean``, ``/ std``)
+    to preserve bit-for-bit FP32 equivalence with ``functional.normalize``
+    (the unit tests compare against ``1/6`` etc. with ``==``). The only
+    optimization is that the mean/std broadcast tensors are cached per
+    config, eliminating the per-call H2D transfer and small-tensor
+    allocation that the previous code did on every inference call.
+    """
+    if scaling_factor is not None:
+        tensor = tensor / scaling_factor
+    if normalization is not None:
+        if not tensor.is_floating_point():
+            tensor = tensor.to(dtype=torch.float32)
+        mean_t, std_t = _get_normalize_constants(
+            mean=normalization[0],
+            std=normalization[1],
+            device=tensor.device,
+            dtype=tensor.dtype,
+        )
+        tensor = (tensor - mean_t) / std_t
+    return tensor
+
 
 def _get_pinned_staging_buffer(
     shape: Tuple[int, ...],
@@ -375,16 +440,9 @@ def handle_tensor_input_preparation_with_stretch(
     )
     if input_color_mode != network_input.color_mode:
         image = image[:, [2, 1, 0], :, :]
-    if network_input.scaling_factor is not None:
-        image = image / network_input.scaling_factor
-    if network_input.normalization is not None:
-        if not image.is_floating_point():
-            image = image.to(dtype=torch.float32)
-        image = functional.normalize(
-            image,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    image = _maybe_apply_scale_and_normalize(
+        image, network_input.scaling_factor, network_input.normalization
+    )
     metadata = PreProcessingMetadata(
         pad_left=0,
         pad_top=0,
@@ -456,16 +514,9 @@ def handle_torch_input_preparation_with_letterbox(
         scale_height=scale,
         static_crop_offset=static_crop_offset,
     )
-    if network_input.scaling_factor is not None:
-        final_batch = final_batch / network_input.scaling_factor
-    if network_input.normalization is not None:
-        if not final_batch.is_floating_point():
-            final_batch = final_batch.to(dtype=torch.float32)
-        final_batch = functional.normalize(
-            final_batch,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    final_batch = _maybe_apply_scale_and_normalize(
+        final_batch, network_input.scaling_factor, network_input.normalization
+    )
     return final_batch.contiguous(), [metadata] * final_batch.shape[0]
 
 
@@ -544,16 +595,9 @@ def handle_torch_input_preparation_with_center_crop(
         scale_height=1.0,
         static_crop_offset=static_crop_offset,
     )
-    if network_input.scaling_factor is not None:
-        image = image / network_input.scaling_factor
-    if network_input.normalization is not None:
-        if not image.is_floating_point():
-            image = image.to(dtype=torch.float32)
-        image = functional.normalize(
-            image,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    image = _maybe_apply_scale_and_normalize(
+        image, network_input.scaling_factor, network_input.normalization
+    )
     return image.contiguous(), [image_metadata] * image.shape[0]
 
 
@@ -602,16 +646,9 @@ def handle_torch_input_preparation_fitting_longer_edge(
         scale_height=actual_target_size.height / size_after_pre_processing.height,
         static_crop_offset=static_crop_offset,
     )
-    if network_input.scaling_factor is not None:
-        image = image / network_input.scaling_factor
-    if network_input.normalization is not None:
-        if not image.is_floating_point():
-            image = image.to(dtype=torch.float32)
-        image = functional.normalize(
-            image,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    image = _maybe_apply_scale_and_normalize(
+        image, network_input.scaling_factor, network_input.normalization
+    )
     return image.contiguous(), [image_metadata] * image.shape[0]
 
 
@@ -743,16 +780,9 @@ def handle_tensor_list_input_preparation_with_stretch(
             size=[target_size.height, target_size.width],
             mode="bilinear",
         )
-        if network_input.scaling_factor is not None:
-            img = img / network_input.scaling_factor
-        if network_input.normalization is not None:
-            if not img.is_floating_point():
-                img = img.to(dtype=torch.float32)
-            img = functional.normalize(
-                img,
-                mean=network_input.normalization[0],
-                std=network_input.normalization[1],
-            )
+        img = _maybe_apply_scale_and_normalize(
+            img, network_input.scaling_factor, network_input.normalization
+        )
         processed.append(img.contiguous())
         image_metadata = PreProcessingMetadata(
             pad_left=0,
@@ -837,16 +867,9 @@ def handle_tensor_list_input_preparation_with_letterbox(
             static_crop_offset=static_crop_offsets[i],
         )
         images_metadata.append(image_metadata)
-    if network_input.scaling_factor is not None:
-        final_batch = final_batch / network_input.scaling_factor
-    if network_input.normalization:
-        if not final_batch.is_floating_point():
-            final_batch = final_batch.to(dtype=torch.float32)
-        final_batch = functional.normalize(
-            final_batch,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    final_batch = _maybe_apply_scale_and_normalize(
+        final_batch, network_input.scaling_factor, network_input.normalization
+    )
     return final_batch.contiguous(), images_metadata
 
 
@@ -1110,16 +1133,9 @@ def handle_numpy_input_preparation_with_stretch(
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
         tensor = tensor[:, [2, 1, 0], :, :]
-    if network_input.scaling_factor is not None:
-        tensor = tensor / network_input.scaling_factor
-    if network_input.normalization:
-        if not tensor.is_floating_point():
-            tensor = tensor.to(dtype=torch.float32)
-        tensor = functional.normalize(
-            tensor,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    tensor = _maybe_apply_scale_and_normalize(
+        tensor, network_input.scaling_factor, network_input.normalization
+    )
     image_metadata = PreProcessingMetadata(
         pad_left=0,
         pad_top=0,
@@ -1191,16 +1207,9 @@ def handle_numpy_input_preparation_with_letterbox(
         scale_height=scale,
         static_crop_offset=static_crop_offset,
     )
-    if network_input.scaling_factor is not None:
-        final_batch = final_batch / network_input.scaling_factor
-    if network_input.normalization is not None:
-        if not final_batch.is_floating_point():
-            final_batch = final_batch.to(dtype=torch.float32)
-        final_batch = functional.normalize(
-            final_batch,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    final_batch = _maybe_apply_scale_and_normalize(
+        final_batch, network_input.scaling_factor, network_input.normalization
+    )
     return final_batch.contiguous(), [image_metadata]
 
 
@@ -1270,16 +1279,9 @@ def handle_numpy_input_preparation_with_center_crop(
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
         tensor = tensor[:, [2, 1, 0], :, :]
-    if network_input.scaling_factor is not None:
-        tensor = tensor / network_input.scaling_factor
-    if network_input.normalization:
-        if not tensor.is_floating_point():
-            tensor = tensor.to(dtype=torch.float32)
-        tensor = functional.normalize(
-            tensor,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    tensor = _maybe_apply_scale_and_normalize(
+        tensor, network_input.scaling_factor, network_input.normalization
+    )
     return tensor.contiguous(), [image_metadata]
 
 
@@ -1328,16 +1330,9 @@ def handle_numpy_input_preparation_fitting_longer_edge(
     tensor = tensor.permute(0, 3, 1, 2)
     if input_color_mode != network_input.color_mode:
         tensor = tensor[:, [2, 1, 0], :, :]
-    if network_input.scaling_factor is not None:
-        tensor = tensor / network_input.scaling_factor
-    if network_input.normalization:
-        if not tensor.is_floating_point():
-            tensor = tensor.to(dtype=torch.float32)
-        tensor = functional.normalize(
-            tensor,
-            mean=network_input.normalization[0],
-            std=network_input.normalization[1],
-        )
+    tensor = _maybe_apply_scale_and_normalize(
+        tensor, network_input.scaling_factor, network_input.normalization
+    )
     return tensor.contiguous(), [image_metadata]
 
 
