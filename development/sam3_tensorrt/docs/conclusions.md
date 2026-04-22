@@ -1,21 +1,28 @@
 # Conclusions and recommendations
 
-After measuring correctness with a logit-level gate and latency across
-PT (bf16/fp16/fp32) and TRT (various precision pinning strategies) on
-both L4 (Ada, native bf16) and T4 (Turing, emulated bf16), the overall
-picture is:
+After measuring latency + correctness across 100 COCO images (see
+[100-image-study.md](100-image-study.md)) at PT-bf16, PT-fp16, TRT
+backbone-swap, and whole-model HF-TRT configurations on T4 (Turing)
+and extrapolating to L4 (Ada), the overall picture is:
 
 ## TL;DR
 
-- The TRT pipeline works and produces numerically correct results.
-- On **T4**, the best correct TRT engine delivers **3.2x E2E speedup vs
-  the repo default** -- but a one-line PyTorch change delivers **5.7x
-  with zero TRT overhead**. TRT should not ship as the T4 answer.
+- **Shipping fix**: in `segment_anything3.py`, pick fp16 autocast on
+  pre-Ampere GPUs (T4/V100) and bf16 on Ampere+. One-line change,
+  5.7× faster on T4, no loss of correctness. See "The real win"
+  below.
+- The SAM3-repo TRT backbone-swap is a viable production engine:
+  99.3% F1 vs PT-bf16 on 100 images, essentially indistinguishable
+  from PT-fp16. Ship it if you need a TRT artifact (Jetson, C++
+  server, etc.).
+- The whole-model HF-TRT engine (`dataplayer12`-style) is fastest at
+  366 ms on T4 but has a **22% recall regression** that does not
+  yield to any precision-level or ONNX-level fix we tried across
+  eight experiments. See [hf-trt-investigation.md](hf-trt-investigation.md)
+  for the diagnosis and failed rescue attempts.
 - On **L4**, the PyTorch baseline is already at the hardware roofline
-  and no correct TRT variant beats it.
-- The TRT pipeline still has a place for deployments where Python + PT
-  are not the runtime (C++ servers, Jetson). Not for this repo's
-  current deployment shape.
+  and no correct TRT variant beats it. Different story on Jetson /
+  embedded where PT doesn't have flash-attn; we didn't test there.
 
 ## The real win: change PyTorch dtype selection
 

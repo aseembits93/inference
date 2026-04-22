@@ -33,7 +33,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-IMAGE = Path("/home/ubuntu/inference/tests/workflows/integration_tests/execution/assets/dogs.jpg")
+IMAGE = Path(os.environ.get("SAM3_ASSETS", "tests/workflows/integration_tests/execution/assets")) / "dogs.jpg"
 PROMPT = "dog"
 ENGINE = Path(
     "./sam3_onnx_exports/"

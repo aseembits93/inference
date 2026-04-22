@@ -11,13 +11,20 @@ most GPUs -- see [docs/conclusions.md](docs/conclusions.md).
 
 ## Quick links
 
-- [docs/benchmarks.md](docs/benchmarks.md) -- latency and correctness numbers
-  on T4 and L4.
+- [docs/benchmarks.md](docs/benchmarks.md) -- original single-image
+  latency + correctness on T4 and L4.
+- [docs/100-image-study.md](docs/100-image-study.md) -- **100-image**
+  correctness study across 53 COCO classes, the most reliable numbers
+  in this directory.
 - [docs/correctness.md](docs/correctness.md) -- how correctness is measured
   (mask IoU gate + logit cosine / std-ratio gate) and why the logit gate is
   the one to trust.
 - [docs/precision-bug.md](docs/precision-bug.md) -- the FP16 numerical
-  issue that forced per-layer FP32 pinning in the RoPE math.
+  issue in the SAM3-repo path that forced per-layer FP32 pinning in the
+  RoPE math.
+- [docs/hf-trt-investigation.md](docs/hf-trt-investigation.md) -- why
+  the whole-model HF SAM3 TRT engine has 22% lower recall and 8
+  experiments that failed to fix it.
 - [docs/vs-dataplayer12.md](docs/vs-dataplayer12.md) -- comparison with
   `dataplayer12/SAM3-TensorRT`.
 - [docs/conclusions.md](docs/conclusions.md) -- what to ship, what to skip.
