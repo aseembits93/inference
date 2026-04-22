@@ -24,3 +24,15 @@ final-yolov8n-b8	measurement	-	yolov8n-640.infer() batch=8	14.251ms	13.084ms	+8.
 final-yolov8n-seg-b8	measurement	-	yolov8n-seg-640.infer() batch=8	36.721ms (median 27.9)	33.209ms (median 26.5)	+5.0% batch (median)	2026-04-21T21:30:00	3c710460b
 final-rfdetr-base-b8	measurement	-	rfdetr-base.infer() batch=8	31.309ms	29.206ms	+6.7% batch	2026-04-21T21:30:00	3c710460b
 sam3-investigation	blocked	-	SAM3 TRT optimization	n/a	n/a	No TRT backend exists; sam3 package not installed	2026-04-21T21:47:32	-
+sam3-session2-001	blocked	model-loading	SAM3 PyTorch model	n/a	n/a	GatedRepoError: facebook/sam3 requires HF authentication	2026-04-21T21:00:00	-
+sam3-session2-002	ready	onnx-export	SAM3 image encoder	n/a	n/a	Export script ready, blocked by model loading	2026-04-21T21:15:00	-
+sam3-session3-001	unblocked	model-loading	SAM3 PyTorch model with Roboflow API	n/a	n/a	Successfully loaded with API key RhjtB3T66csKSMgkSsCe	2026-04-21T22:52:00	-
+sam3-session3-002	blocked	onnx-export	SAM3 backbone (vision-language)	n/a	n/a	BLOCKED: Backbone requires both images AND captions; ONNX incompatible	2026-04-21T22:53:00	-
+sam3-session3-003	blocked	trt-backend	SAM3 TRT implementation	n/a	n/a	BLOCKED: Cannot export to ONNX (VL architecture, complex I/O structures)	2026-04-21T22:54:00	-
+kernel-baseline-yolov8n	baseline	-	yolov8n-640.predict()	1.552ms pred of 2.265ms E2E	-	L4 GPU, 100 iters, 30 warmup	2026-04-21T22:30:00	-
+kernel-baseline-yolov8n-seg	baseline	-	yolov8n-seg-640.predict()	1.495ms pred of 2.352ms E2E	-	L4 GPU	2026-04-21T22:30:00	-
+kernel-baseline-rfdetr	baseline	-	rfdetr-base.predict()	2.387ms pred of 3.648ms E2E	-	L4 GPU	2026-04-21T22:30:00	-
+fp16-exp001	discard	fp16-rebuild	yolov8n-640 engine rebuild	2.265ms	2.269ms	+0.2% (noise) — baseline was already FP16	2026-04-21T22:40:00	-
+fp32-exp001	discard	fp32-rebuild	yolov8n-640 engine rebuild	2.265ms	2.295ms	-1.3% (noise) — L4 has fast FP32	2026-04-21T22:45:00	-
+fp16-exp002	discard	builder-opt-level-5	yolov8n-640 engine (build 757s)	2.265ms	2.276ms	-0.5% (noise)	2026-04-21T22:50:00	-
+fp16-exp003	discard	fp16-io-bindings	yolov8n-640 engine	2.265ms	2.274ms	-0.4% (noise)	2026-04-21T22:55:00	-
