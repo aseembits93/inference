@@ -31,6 +31,11 @@ most GPUs -- see [docs/conclusions.md](docs/conclusions.md).
   why HF's PyTorch SAM3 differs from Roboflow's PyTorch SAM3 even
   though they share identical weights. Pre/post identical, vision
   backbone bit-identical per block; drift is in DETR/heads.
+- [docs/hf-drift-root-cause.md](docs/hf-drift-root-cause.md) --
+  **root cause found**: HF skips the `geometry_encoder` (and its
+  `cls_embed`) when no input boxes are given. Forcing the path via a
+  dummy padding box (`input_boxes_labels=-10`) recovers bit-exact
+  agreement with Roboflow on `pred_logits` and `pred_masks`.
 - [docs/vs-dataplayer12.md](docs/vs-dataplayer12.md) -- comparison with
   `dataplayer12/SAM3-TensorRT`.
 - [docs/conclusions.md](docs/conclusions.md) -- what to ship, what to skip.
