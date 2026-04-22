@@ -41,7 +41,34 @@ the PT-bf16 reference. A match counts "good" if IoU >= 0.5.
 | **PT-bf16** (reference) | **2856** | — | — | — | — | — | — |
 | **PT-fp16** (autocast fix) | **516** | **98.9%** | **98.6%** | **98.7%** | **93/100** | **0.996** | **+0.001** |
 | **TRT-swap** (fp16_rope_windowed_d8) | **578** | **99.1%** | **99.4%** | **99.3%** | **96/100** | **0.996** | **+0.002** |
+| **HF-PT** (HuggingFace Sam3Model, PyTorch only) | **1800** | **98.3%** | **93.0%** | **95.6%** | **85/100** | **0.960** | **+0.041** |
 | **HF-TRT** (whole-model FP16) | **366** | **78.4%** | **88.5%** | **83.1%** | **73/100** | **0.879** | **−0.081** |
+
+### HF-PT vs HF-TRT: decomposing where the 20-point recall gap comes from
+
+The HF-TRT row includes *two* sources of divergence from PT-bf16:
+**(a)** `transformers.Sam3Model` itself is not bit-equivalent to the
+SAM3 repo's `SegmentAnything3`, even in PyTorch — different
+implementation of the same published model; **(b)** a TRT-specific
+mis-lowering on top of HF's PyTorch behavior.
+
+Sanity-checked by running HF-PT (no TRT) on the same 100 images.
+Decomposing the gap:
+
+| Reference | HF-TRT recall | HF-TRT mean IoU | Score delta |
+|---|---:|---:|---:|
+| vs PT-bf16 (Roboflow SAM3) | 78.4% | 0.879 | −0.081 |
+| **vs HF-PT** (same HF code) | **74.2%** | **0.900** | **−0.123** |
+
+Both comparisons show substantial TRT-induced regression. HF-PT
+itself is already ~5 points worse than Roboflow's PyTorch on recall
+(98.3% vs 98.9%) and ~6 points lower on mask IoU (0.960 vs 0.996),
+even before TRT enters the picture. On top of that, TRT adds another
+24 points of recall loss and 6 more points of IoU degradation.
+
+The bottom line doesn't change: HF-TRT is not shippable as the SAM3
+serving path. But the 22% recall gap is not purely a TRT bug — about
+5 points are HF-vs-Roboflow, and ~17 points are TRT-on-HF.
 
 ### Key findings
 

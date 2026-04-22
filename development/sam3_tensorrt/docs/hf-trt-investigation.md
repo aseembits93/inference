@@ -5,22 +5,38 @@ then `trtexec --fp16` — runs fast (366 ms on T4, the fastest of any
 tested config) but only achieves **78.4% recall** on the 100-image
 benchmark vs PT-bf16's 99%+.
 
-This doc is the full debug trail. Spoiler: the bug is intrinsic to
-TRT's handling of the SDPA attention graph in HF's SAM3, not something
-fixable with per-layer precision pinning or ONNX simplification.
+**Sanity check upfront:** the HF `Sam3Model` PyTorch path is already
+slightly off from the Roboflow SAM3 repo baseline — HF-PT on 100
+images gets 98.3% recall / 0.960 mean IoU / +0.041 score delta vs
+PT-bf16. So ~5 of the 20 recall points lost in HF-TRT are from the
+HF-vs-Roboflow code divergence, not from TRT. But against HF-PT
+itself as reference, HF-TRT still loses **~24 points of recall** and
+compresses scores by −0.12. The rest of this doc is the debug trail
+for that TRT-specific portion.
+
+Spoiler: the bug is intrinsic to TRT's handling of the SDPA attention
+graph in HF's SAM3, not something fixable with per-layer precision
+pinning or ONNX simplification.
 
 ## The pattern
 
-HF-TRT systematically:
-- Misses ~22% of reference detections
-- When it does detect, mean match IoU is 0.879 (vs 0.996 for
-  correct configs)
-- Confidence scores drop uniformly by ~8 points
+Measured against HF-PT (correct reference for this family), HF-TRT
+systematically:
+- Misses ~24% of detections that HF-PT finds (74.2% recall)
+- When it does detect, mean match IoU is 0.900 (vs HF-PT as
+  reference, i.e. 10 mask-IoU points lower than a perfect
+  round-trip)
+- Confidence scores drop uniformly by ~12 points (median delta
+  −0.117)
 - Logit std compresses from PT's ~1.29 to TRT's ~0.74 on the last
   DETR decoder layer
 - Failure concentrates on dense multi-instance scenes (book,
   handbag, suitcase, bed, keyboard — all 52-67% recall vs 100% on
   easier classes)
+
+Add ~5 points of HF-vs-Roboflow divergence on top of this to get
+the 78.4% recall figure we see against the Roboflow PT-bf16
+reference in the 100-image study.
 
 ## Hypothesis chain and experiments
 
