@@ -27,6 +27,10 @@ most GPUs -- see [docs/conclusions.md](docs/conclusions.md).
 - [docs/hf-trt-investigation.md](docs/hf-trt-investigation.md) -- why
   the whole-model HF SAM3 TRT engine has 22% lower recall and 8
   experiments that failed to fix it.
+- [docs/hf-vs-roboflow-drift.md](docs/hf-vs-roboflow-drift.md) --
+  why HF's PyTorch SAM3 differs from Roboflow's PyTorch SAM3 even
+  though they share identical weights. Pre/post identical, vision
+  backbone bit-identical per block; drift is in DETR/heads.
 - [docs/vs-dataplayer12.md](docs/vs-dataplayer12.md) -- comparison with
   `dataplayer12/SAM3-TensorRT`.
 - [docs/conclusions.md](docs/conclusions.md) -- what to ship, what to skip.
