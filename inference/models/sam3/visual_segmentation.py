@@ -169,7 +169,10 @@ class Sam3ForInteractiveImageSegmentation(RoboflowCoreModel):
                 image_id,
             )
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        autocast_dtype = (
+            torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        )
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
             with _temporarily_disable_torch_jit_script():
                 processor = Sam3Processor(self.sam_model)
             state = processor.set_image(torch.from_numpy(img_in).permute(2, 0, 1))

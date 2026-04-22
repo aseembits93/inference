@@ -531,8 +531,11 @@ class SegmentAnything3(RoboflowCoreModel):
         pil_image = Image.fromarray(np_image)
 
         # Inference-only path; disable autograd throughout
+        autocast_dtype = (
+            torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        )
         with torch.inference_mode():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype):
                 start_ts = perf_counter()
 
                 # TODO this can also take tensor directly instead of PIL image, so we want to avoid double conversion
