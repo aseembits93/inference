@@ -16,6 +16,8 @@ most GPUs -- see [docs/conclusions.md](docs/conclusions.md).
 - [docs/100-image-study.md](docs/100-image-study.md) -- **100-image**
   correctness study across 53 COCO classes, the most reliable numbers
   in this directory.
+- [docs/benchmark-summary.md](docs/benchmark-summary.md) -- one-page
+  table of every config benchmarked, recall/precision/IoU/speedup.
 - [docs/correctness.md](docs/correctness.md) -- how correctness is measured
   (mask IoU gate + logit cosine / std-ratio gate) and why the logit gate is
   the one to trust.
