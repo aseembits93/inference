@@ -36,6 +36,11 @@ most GPUs -- see [docs/conclusions.md](docs/conclusions.md).
   `cls_embed`) when no input boxes are given. Forcing the path via a
   dummy padding box (`input_boxes_labels=-10`) recovers bit-exact
   agreement with Roboflow on `pred_logits` and `pred_masks`.
+- [docs/hf-trt-fixed-verification.md](docs/hf-trt-fixed-verification.md)
+  -- does the cls_embed fix rescue HF-TRT? No. PT F1 recovers to 98.7%,
+  but TRT F1 stays at ~82% (slightly worse) because TRT's FP16
+  regression pays an additional cost when the cls_embed path runs.
+  The ~16 F1-point HF-TRT gap is now entirely TRT's fault.
 - [docs/vs-dataplayer12.md](docs/vs-dataplayer12.md) -- comparison with
   `dataplayer12/SAM3-TensorRT`.
 - [docs/conclusions.md](docs/conclusions.md) -- what to ship, what to skip.
