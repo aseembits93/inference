@@ -339,14 +339,43 @@ class RFDetrForInstanceSegmentationTRT(
                 dtype=torch.float32,
                 device=self._device,
             )
+            # Marker: tells the TRT CUDA-graph capture path to use this
+            # tensor as the graph's own input buffer, eliminating the
+            # per-frame DtoD copy from our preproc output into the graph's
+            # internal buffer. Our preproc always writes in-place here.
+            self._fast_input_buffer._trt_reuse_as_input_buffer = True
             self._fast_means = tuple(means)
             self._fast_stds = tuple(stds)
+            # Pinned host buffer for the raw BGR frame — lets us do a
+            # truly async HtoD into src_gpu. Grown lazily below if the
+            # frame size changes.
+            self._fast_src_host_pinned = None
+            self._fast_src_gpu = None
             self._fast_buffer_initialized = True
 
-        with torch.cuda.stream(self._pre_process_stream):
-            src_gpu = torch.from_numpy(np.ascontiguousarray(images)).to(
-                self._device, non_blocking=True
+        # Reuse a pinned host staging buffer so torch.Tensor.copy_ with
+        # non_blocking=True actually runs async. Without pinning,
+        # non_blocking is silently promoted to a sync copy.
+        src_shape = images.shape
+        src_nbytes = images.nbytes
+        pinned = self._fast_src_host_pinned
+        if (
+            pinned is None
+            or pinned.numel() * pinned.element_size() < src_nbytes
+            or tuple(pinned.shape) != src_shape
+        ):
+            pinned = torch.empty(src_shape, dtype=torch.uint8, pin_memory=True)
+            self._fast_src_host_pinned = pinned
+            self._fast_src_gpu = torch.empty(
+                src_shape, dtype=torch.uint8, device=self._device
             )
+        # Copy the numpy BGR frame into pinned host memory (fast CPU memcpy),
+        # then async DtoH->GPU while the Triton launch happens on CPU side.
+        pinned_np = pinned.numpy()
+        np.copyto(pinned_np, images, casting="no")
+        src_gpu = self._fast_src_gpu
+        with torch.cuda.stream(self._pre_process_stream):
+            src_gpu.copy_(pinned, non_blocking=True)
             triton_preprocess_rfdetr_stretch(
                 src_gpu,
                 target_h=target_h,

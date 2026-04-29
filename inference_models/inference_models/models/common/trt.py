@@ -706,12 +706,20 @@ def _execute_trt_engine(
         if cache_key not in trt_cuda_graph_cache:
             LOGGER.debug("Capturing CUDA graph for shape %s", input_shape)
 
+            # If the caller hands us a stable pre-allocated buffer and
+            # promises to keep writing in-place to it, we can bake its
+            # address directly into the graph and skip the per-frame DtoD
+            # copy. Marker attribute set by the model's pre_process path.
+            use_external = getattr(
+                pre_processed_images, "_trt_reuse_as_input_buffer", False
+            )
             results, trt_cuda_graph = _capture_cuda_graph(
                 pre_processed_images=pre_processed_images,
                 engine=engine,
                 device=device,
                 input_name=input_name,
                 outputs=outputs,
+                use_pre_processed_images_as_input_buffer=bool(use_external),
             )
             trt_cuda_graph_cache[cache_key] = trt_cuda_graph
             return results
@@ -726,7 +734,11 @@ def _execute_trt_engine(
             if consumer_done is not None:
                 consumer_done.wait(stream)
             with torch.cuda.stream(stream):
-                trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
+                # Skip the DtoD copy if the caller is writing in-place to
+                # the graph's own input buffer (input_buffer is the same
+                # torch.Tensor object as pre_processed_images).
+                if trt_cuda_graph_state.input_buffer.data_ptr() != pre_processed_images.data_ptr():
+                    trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
                 trt_cuda_graph_state.cuda_graph.replay()
             # Return graph-owned output buffers directly — no clone. Attach
             # the graph state as a side-channel so consumers can record into
@@ -775,14 +787,21 @@ def _capture_cuda_graph(
     device: torch.device,
     input_name: str,
     outputs: List[str],
+    use_pre_processed_images_as_input_buffer: bool = False,
 ) -> Tuple[List[torch.Tensor], TRTCudaGraphState]:
     # Each CUDA graph needs its own execution context. Sharing a single context
     # across graphs for different input shapes causes TRT to reallocate internal
     # workspace buffers, invalidating GPU addresses baked into earlier graphs.
     graph_context = engine.create_execution_context()
 
-    input_buffer = torch.empty_like(pre_processed_images, device=device)
-    input_buffer.copy_(pre_processed_images)
+    if use_pre_processed_images_as_input_buffer:
+        # Zero-copy: TRT reads directly from the caller's buffer. The caller
+        # must keep this exact tensor alive for the lifetime of the graph
+        # and re-write its contents in-place before every replay.
+        input_buffer = pre_processed_images
+    else:
+        input_buffer = torch.empty_like(pre_processed_images, device=device)
+        input_buffer.copy_(pre_processed_images)
 
     status = graph_context.set_input_shape(
         input_name, tuple(pre_processed_images.shape)
