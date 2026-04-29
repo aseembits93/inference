@@ -284,18 +284,23 @@ def _next_pow2(n: int) -> int:
 _THRESHOLD_CACHE: dict = {}
 _EMPTY_INT32 = torch.empty((1,), dtype=torch.int32)
 _MASK_BIN_BUFFER_CACHE: dict = {}
-# Cache the per-call scratch (combined/survivor_idx/mask_any/counter) keyed
-# by (num_queries, device). Eliminates 3 per-frame torch.empty allocator
-# calls and stabilizes stride/pointer values across the Triton JIT cache.
+# Scratch cache keyed by (num_queries, device, slot_idx). slot_idx lets
+# callers ping-pong between multiple scratch sets so that an in-flight
+# consumer reading frame N-1's outputs can't be overwritten by frame N's
+# kernels. Default slot is 0 (single-slot behavior, unchanged).
 _SCRATCH_CACHE: dict = {}
 # Cache a converted-to-int32 view of the class_mapping tensor. The upstream
 # model stores it as int64, but our Triton kernel needs int32; without a
 # cache we relaunch direct_copy_kernel_cuda every frame.
 _CLASS_MAPPING_INT32_CACHE: dict = {}
+# Module-level counter for slot selection when the caller doesn't pass one.
+# Each triton_rfdetr_fullpost call increments it so successive calls land in
+# different slots (depth-2 pipelining).
+_SLOT_COUNTER: int = 0
 
 
-def _get_scratch_buffers(num_queries: int, device: torch.device):
-    key = (num_queries, device)
+def _get_scratch_buffers(num_queries: int, device: torch.device, slot_idx: int = 0):
+    key = (num_queries, device, slot_idx)
     cached = _SCRATCH_CACHE.get(key)
     if cached is None:
         combined = torch.empty((num_queries, 6), dtype=torch.int32, device=device)
@@ -320,7 +325,7 @@ def _get_class_mapping_int32(class_mapping: torch.Tensor, device: torch.device) 
 
 
 def _get_mask_bin_buffer(
-    capacity: int, orig_h: int, orig_w: int, device: torch.device
+    capacity: int, orig_h: int, orig_w: int, device: torch.device, slot_idx: int = 0
 ) -> torch.Tensor:
     """Return a reusable (capacity, orig_h, orig_w) uint8 mask buffer.
 
@@ -329,8 +334,11 @@ def _get_mask_bin_buffer(
     We return the full buffer; the caller views [:n_survivors]. Rows beyond
     n_survivors may contain stale data from prior frames; the caller must
     only read the slice it sizes via the atomic counter.
+
+    slot_idx lets depth-2 pipelined callers alternate between slots so the
+    consumer reading slot 0 isn't racing with the writer on slot 1.
     """
-    key = (capacity, orig_h, orig_w, device)
+    key = (capacity, orig_h, orig_w, device, slot_idx)
     buf = _MASK_BIN_BUFFER_CACHE.get(key)
     if buf is None:
         buf = torch.empty(
@@ -367,6 +375,7 @@ def triton_rfdetr_fullpost(
     pad_ltrb: Tuple[int, int, int, int],   # (left, top, right, bottom) in inference coords
     scale_wh: Tuple[float, float],         # (scale_w, scale_h) = eff_w/orig_w, eff_h/orig_h
     orig_size_wh: Tuple[int, int],         # (W, H) of the original image
+    num_slots: int = 1,                    # ping-pong across N slots; 1 = no pipelining
 ) -> Tuple[
     torch.Tensor,      # combined (num_queries, 6) int32 — UNSLICED
     torch.Tensor,      # mask_bin (num_queries, orig_h, orig_w) uint8 — UNSLICED
@@ -411,11 +420,21 @@ def triton_rfdetr_fullpost(
     bboxes_2d = bboxes[0] if bboxes[0].is_contiguous() else bboxes[0].contiguous()
     masks_3d = masks[0] if masks[0].is_contiguous() else masks[0].contiguous()
 
+    # Pick a slot. For num_slots==1 (default) we always hit slot 0, preserving
+    # the single-slot behavior. For num_slots>=2, we rotate so the consumer
+    # still reading slot (N-1) % num_slots isn't overwritten by slot N.
+    global _SLOT_COUNTER
+    if num_slots > 1:
+        slot_idx = _SLOT_COUNTER % num_slots
+        _SLOT_COUNTER += 1
+    else:
+        slot_idx = 0
+
     # Reuse persistent scratch across frames. Avoids 3 torch.empty allocator
     # calls per frame and keeps all downstream .stride() / pointer values
     # stable across the Triton JIT cache.
     combined, survivor_idx, mask_any, counter = _get_scratch_buffers(
-        num_queries, device
+        num_queries, device, slot_idx
     )
     # Reset the atomic counter. zero_() still launches FillFunctor (2.5 µs on
     # T4), but there's no safe way to inline this into the filter kernel —
@@ -472,7 +491,7 @@ def triton_rfdetr_fullpost(
     # checks counter[0] on GPU and early-exits if its s index is out of
     # range. This lets us skip a CPU-blocking counter.item() between the
     # two kernel launches — both get queued to the stream immediately.
-    mask_bin_full = _get_mask_bin_buffer(num_queries, orig_h, orig_w, device)
+    mask_bin_full = _get_mask_bin_buffer(num_queries, orig_h, orig_w, device, slot_idx)
 
     BLOCK_H = 16
     BLOCK_W = 16

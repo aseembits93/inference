@@ -290,6 +290,22 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             **kwargs,
         )
         self.class_names = list(self._model.class_names)
+        # Depth-2 pipeline state. When RFDETR_PIPELINE_DEPTH=2, postprocess()
+        # returns frame N-1's response when called with frame N's detections.
+        # The pending slot holds refs to frame N-1's GPU scratch + done_event.
+        # CAVEATS (documented in PR):
+        #   - on_prediction(predictions, video_frame) callbacks receive
+        #     frame N-1's detections paired with frame N's video_frame
+        #     (1-frame skew). Imperceptible at 150+ FPS.
+        #   - Last frame's predictions are dropped unless flush() is called
+        #     explicitly (no plumbing from InferencePipeline to call it).
+        try:
+            self._pipeline_depth = int(os.getenv("RFDETR_PIPELINE_DEPTH", "1"))
+        except (TypeError, ValueError):
+            self._pipeline_depth = 1
+        if self._pipeline_depth < 1:
+            self._pipeline_depth = 1
+        self._pipeline_pending = None  # (det_ref, H, W, class_filter_tuple)
 
     def map_inference_kwargs(self, kwargs: dict) -> dict:
         pre_processing_overrides = PreProcessingOverrides(
@@ -319,6 +335,98 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         mapped_kwargs = self.map_inference_kwargs(kwargs)
         return self._model.forward(img_in, **mapped_kwargs)
 
+    def _build_response_from_det(
+        self, det, H, W, class_filter
+    ) -> InstanceSegmentationInferenceResponse:
+        """Drain GPU scratch into a response. Factored out of postprocess so
+        the depth-2 path can defer it from frame N to frame N+1."""
+        combined_gpu = getattr(det, "_combined_gpu", None)
+        counter_gpu = getattr(det, "_counter_gpu", None)
+        done_event = getattr(det, "_postproc_done_event", None)
+        if (
+            combined_gpu is not None
+            and counter_gpu is not None
+            and done_event is not None
+            and det.mask.is_cuda
+        ):
+            device = combined_gpu.device
+            stream = torch.cuda.current_stream(device)
+            done_event.wait(stream)
+
+            counter_host = _get_pinned_buffer("counter", (1,), torch.int32)
+            counter_host.copy_(counter_gpu, non_blocking=True)
+            stream.synchronize()
+            n_survivors = int(counter_host[0].item())
+
+            if n_survivors == 0:
+                xyxy = np.empty((0, 4), dtype=np.int32)
+                confs = np.empty((0,), dtype=np.float32)
+                class_ids = np.empty((0,), dtype=np.int32)
+                masks = np.empty((0, 0, 0), dtype=np.uint8)
+            else:
+                mask_gpu = det.mask
+                combined_slice = combined_gpu[:n_survivors]
+                mask_slice = mask_gpu[:n_survivors]
+                combined_host = _get_pinned_buffer(
+                    "combined", combined_slice.shape, combined_slice.dtype
+                )
+                mask_host = _get_pinned_buffer(
+                    "mask", mask_slice.shape, mask_slice.dtype
+                )
+                combined_host.copy_(combined_slice, non_blocking=True)
+                mask_host.copy_(mask_slice, non_blocking=True)
+                stream.synchronize()
+                combined_cpu = combined_host.numpy()
+                xyxy = combined_cpu[:, :4]
+                confs = combined_cpu[:, 4].view(np.float32)
+                class_ids = combined_cpu[:, 5]
+                masks = mask_host.numpy()
+        elif combined_gpu is not None:
+            combined_cpu = combined_gpu.detach().cpu().numpy()
+            xyxy = combined_cpu[:, :4]
+            confs = combined_cpu[:, 4].view(np.float32)
+            class_ids = combined_cpu[:, 5]
+            masks = det.mask.detach().cpu().numpy()
+        else:
+            xyxy = det.xyxy.detach().cpu().numpy()
+            confs = det.confidence.detach().cpu().numpy()
+            class_ids = det.class_id.detach().cpu().numpy()
+            masks = det.mask.detach().cpu().numpy()
+        polys = masks2poly(masks)
+
+        preds: List[InstanceSegmentationPrediction] = []
+        for (x1, y1, x2, y2), mask_as_poly, conf, class_id in zip(
+            xyxy, polys, confs, class_ids
+        ):
+            cx = (float(x1) + float(x2)) / 2.0
+            cy = (float(y1) + float(y2)) / 2.0
+            w = float(x2) - float(x1)
+            h = float(y2) - float(y1)
+            class_id_int = int(class_id)
+            class_name = (
+                self.class_names[class_id_int]
+                if 0 <= class_id_int < len(self.class_names)
+                else str(class_id_int)
+            )
+            if class_filter and class_name not in class_filter:
+                continue
+            preds.append(
+                InstanceSegmentationPrediction(
+                    x=cx,
+                    y=cy,
+                    width=w,
+                    height=h,
+                    confidence=float(conf),
+                    points=[Point(x=p[0], y=p[1]) for p in mask_as_poly],
+                    **{"class": class_name},
+                    class_id=class_id_int,
+                )
+            )
+        return InstanceSegmentationInferenceResponse(
+            predictions=preds,
+            image=InferenceResponseImage(width=W, height=H),
+        )
+
     def postprocess(
         self,
         predictions: List[InstanceDetections],
@@ -329,115 +437,47 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         detections_list = self._model.post_process(
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
-        gpu_fastpath = os.getenv("RFDETR_GPU_POSTPROCESS", "true").lower() in ("true", "1")
+
+        if self._pipeline_depth >= 2 and len(detections_list) == 1:
+            # Depth-2 path: only engages for batch=1 workflow calls. Push
+            # current frame's det+meta as the new pending; return the prior
+            # pending's materialized response. First call yields an empty
+            # response because there's no prior work. The prior frame's GPU
+            # scratch was written to a DIFFERENT ping-pong slot (selected by
+            # triton_rfdetr_fullpost's _SLOT_COUNTER), so it's still safe to
+            # drain while the current frame's Triton kernels run on the other
+            # slot.
+            preproc_metadata = preprocess_return_metadata[0]
+            det = detections_list[0]
+            H = preproc_metadata.original_size.height
+            W = preproc_metadata.original_size.width
+            class_filter = kwargs.get("class_filter")
+
+            pending = self._pipeline_pending
+            self._pipeline_pending = (det, H, W, class_filter)
+            if pending is None:
+                # First call — no prior frame to drain. Return an empty
+                # response; sink will see frame 0 with nothing.
+                return [
+                    InstanceSegmentationInferenceResponse(
+                        predictions=[],
+                        image=InferenceResponseImage(width=W, height=H),
+                    )
+                ]
+            prev_det, prev_H, prev_W, prev_class_filter = pending
+            return [
+                self._build_response_from_det(
+                    prev_det, prev_H, prev_W, prev_class_filter
+                )
+            ]
 
         responses: List[InstanceSegmentationInferenceResponse] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):
             H = preproc_metadata.original_size.height
             W = preproc_metadata.original_size.width
-
-            # Fast path: triton_rfdetr_fullpost returns UNSLICED buffers plus
-            # a GPU counter tensor and a done-event. We:
-            #   (1) wait the done-event on the current stream so post_process
-            #       stream writes are visible,
-            #   (2) async-DtoH the 4-byte counter into a pinned host buffer
-            #       and sync once — this replaces the old in-kernel
-            #       counter.item() that blocked the postproc stream,
-            #   (3) slice combined/mask to n_survivors and async-DtoH both,
-            #       then sync.
-            combined_gpu = getattr(det, "_combined_gpu", None)
-            counter_gpu = getattr(det, "_counter_gpu", None)
-            done_event = getattr(det, "_postproc_done_event", None)
-            if (
-                combined_gpu is not None
-                and counter_gpu is not None
-                and done_event is not None
-                and det.mask.is_cuda
-            ):
-                device = combined_gpu.device
-                stream = torch.cuda.current_stream(device)
-                done_event.wait(stream)
-
-                counter_host = _get_pinned_buffer("counter", (1,), torch.int32)
-                counter_host.copy_(counter_gpu, non_blocking=True)
-                stream.synchronize()
-                n_survivors = int(counter_host[0].item())
-
-                if n_survivors == 0:
-                    xyxy = np.empty((0, 4), dtype=np.int32)
-                    confs = np.empty((0,), dtype=np.float32)
-                    class_ids = np.empty((0,), dtype=np.int32)
-                    masks = np.empty((0, 0, 0), dtype=np.uint8)
-                else:
-                    mask_gpu = det.mask
-                    combined_slice = combined_gpu[:n_survivors]
-                    mask_slice = mask_gpu[:n_survivors]
-                    combined_host = _get_pinned_buffer(
-                        "combined", combined_slice.shape, combined_slice.dtype
-                    )
-                    mask_host = _get_pinned_buffer(
-                        "mask", mask_slice.shape, mask_slice.dtype
-                    )
-                    combined_host.copy_(combined_slice, non_blocking=True)
-                    mask_host.copy_(mask_slice, non_blocking=True)
-                    stream.synchronize()
-                    combined_cpu = combined_host.numpy()
-                    xyxy = combined_cpu[:, :4]
-                    confs = combined_cpu[:, 4].view(np.float32)
-                    class_ids = combined_cpu[:, 5]
-                    masks = mask_host.numpy()
-            elif combined_gpu is not None:
-                combined_cpu = combined_gpu.detach().cpu().numpy()
-                xyxy = combined_cpu[:, :4]
-                confs = combined_cpu[:, 4].view(np.float32)
-                class_ids = combined_cpu[:, 5]
-                masks = det.mask.detach().cpu().numpy()
-            else:
-                xyxy = det.xyxy.detach().cpu().numpy()
-                confs = det.confidence.detach().cpu().numpy()
-                class_ids = det.class_id.detach().cpu().numpy()
-                masks = det.mask.detach().cpu().numpy()
-            polys = masks2poly(masks)
-
-            predictions: List[InstanceSegmentationPrediction] = []
-
-            for (x1, y1, x2, y2), mask_as_poly, conf, class_id in zip(
-                xyxy, polys, confs, class_ids
-            ):
-                cx = (float(x1) + float(x2)) / 2.0
-                cy = (float(y1) + float(y2)) / 2.0
-                w = float(x2) - float(x1)
-                h = float(y2) - float(y1)
-                class_id_int = int(class_id)
-                class_name = (
-                    self.class_names[class_id_int]
-                    if 0 <= class_id_int < len(self.class_names)
-                    else str(class_id_int)
-                )
-                if (
-                    kwargs.get("class_filter")
-                    and class_name not in kwargs["class_filter"]
-                ):
-                    continue
-                predictions.append(
-                    InstanceSegmentationPrediction(
-                        x=cx,
-                        y=cy,
-                        width=w,
-                        height=h,
-                        confidence=float(conf),
-                        points=[
-                            Point(x=point[0], y=point[1]) for point in mask_as_poly
-                        ],
-                        **{"class": class_name},
-                        class_id=class_id_int,
-                    )
-                )
-
             responses.append(
-                InstanceSegmentationInferenceResponse(
-                    predictions=predictions,
-                    image=InferenceResponseImage(width=W, height=H),
+                self._build_response_from_det(
+                    det, H, W, kwargs.get("class_filter")
                 )
             )
         return responses

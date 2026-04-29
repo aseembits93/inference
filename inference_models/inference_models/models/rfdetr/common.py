@@ -28,6 +28,16 @@ _RFDETR_TRITON_FULLPOSTPROC = os.getenv("RFDETR_TRITON_FULLPOSTPROC", "false").l
     "true",
     "1",
 )
+# Depth of the in-adapter frame pipeline. Default 1 (single-slot, unchanged
+# behavior). Set to 2 to engage depth-2 ping-pong of scratch buffers; the
+# adapter also needs to know to return frame N-1's response when called with
+# frame N, so this flag is read in both places.
+try:
+    _RFDETR_PIPELINE_DEPTH = int(os.getenv("RFDETR_PIPELINE_DEPTH", "1"))
+except (TypeError, ValueError):
+    _RFDETR_PIPELINE_DEPTH = 1
+if _RFDETR_PIPELINE_DEPTH < 1:
+    _RFDETR_PIPELINE_DEPTH = 1
 if _RFDETR_TRITON_FULLPOSTPROC:
     try:
         from inference_models.models.rfdetr.triton_fullpostproc import (
@@ -115,6 +125,7 @@ def post_process_instance_segmentation_results(
             pad_ltrb=(meta.pad_left, meta.pad_top, meta.pad_right, meta.pad_bottom),
             scale_wh=(meta.scale_width, meta.scale_height),
             orig_size_wh=(meta.original_size.width, meta.original_size.height),
+            num_slots=_RFDETR_PIPELINE_DEPTH,
         )
         # Return UNSLICED buffers plus counter + done_event. The adapter does
         # a pinned-host DtoH of counter alongside the combined/mask DtoHs on
