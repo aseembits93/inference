@@ -9,6 +9,26 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+
+# Cache of pinned host buffers for async DtoH, keyed by (name, dtype).
+# Pinned memory lets torch's copy_(non_blocking=True) actually run async.
+# We grow on first use and reuse thereafter; buffer is sliced to the
+# current n_survivors for each copy.
+_PINNED_HOST_BUFFERS: dict = {}
+
+
+def _get_pinned_buffer(name: str, shape, dtype: torch.dtype) -> torch.Tensor:
+    shape = tuple(int(s) for s in shape)
+    key = (name, dtype)
+    buf = _PINNED_HOST_BUFFERS.get(key)
+    if buf is not None:
+        # Reuse if the cached buffer is at least as large in every dim.
+        if all(buf.shape[i] >= shape[i] for i in range(len(shape))):
+            return buf[tuple(slice(0, s) for s in shape)]
+    buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+    _PINNED_HOST_BUFFERS[key] = buf
+    return buf
+
 from inference.core.entities.requests import (
     ClassificationInferenceRequest,
     InferenceRequest,
@@ -322,20 +342,37 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             # get n_survivors (the counter DtoH doubles as the sync for the
             # in-flight .cpu() calls because they're on the same stream).
             # Fast path: single .cpu() of the combined (n, 6) int32 buffer
-            # plus one .cpu() for the mask buffer. Tensors are already
-            # sliced to n_survivors by the Triton wrapper (which did the
-            # counter sync inside the post_process_stream context).
+            # plus one .cpu() for the mask buffer. Use pinned host buffers +
+            # non_blocking=True so both DtoH transfers pipeline on the copy
+            # engine, then sync once at the end.
             combined_gpu = getattr(det, "_combined_gpu", None)
-            if combined_gpu is not None:
+            if combined_gpu is not None and det.mask.is_cuda:
+                mask_gpu = det.mask
+                combined_host = _get_pinned_buffer(
+                    "combined", combined_gpu.shape, combined_gpu.dtype
+                )
+                mask_host = _get_pinned_buffer(
+                    "mask", mask_gpu.shape, mask_gpu.dtype
+                )
+                combined_host.copy_(combined_gpu, non_blocking=True)
+                mask_host.copy_(mask_gpu, non_blocking=True)
+                torch.cuda.current_stream(combined_gpu.device).synchronize()
+                combined_cpu = combined_host.numpy()
+                xyxy = combined_cpu[:, :4]
+                confs = combined_cpu[:, 4].view(np.float32)
+                class_ids = combined_cpu[:, 5]
+                masks = mask_host.numpy()
+            elif combined_gpu is not None:
                 combined_cpu = combined_gpu.detach().cpu().numpy()
                 xyxy = combined_cpu[:, :4]
                 confs = combined_cpu[:, 4].view(np.float32)
                 class_ids = combined_cpu[:, 5]
+                masks = det.mask.detach().cpu().numpy()
             else:
                 xyxy = det.xyxy.detach().cpu().numpy()
                 confs = det.confidence.detach().cpu().numpy()
                 class_ids = det.class_id.detach().cpu().numpy()
-            masks = det.mask.detach().cpu().numpy()
+                masks = det.mask.detach().cpu().numpy()
             polys = masks2poly(masks)
 
             predictions: List[InstanceSegmentationPrediction] = []
