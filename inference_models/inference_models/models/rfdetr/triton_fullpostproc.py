@@ -284,6 +284,39 @@ def _next_pow2(n: int) -> int:
 _THRESHOLD_CACHE: dict = {}
 _EMPTY_INT32 = torch.empty((1,), dtype=torch.int32)
 _MASK_BIN_BUFFER_CACHE: dict = {}
+# Cache the per-call scratch (combined/survivor_idx/mask_any/counter) keyed
+# by (num_queries, device). Eliminates 3 per-frame torch.empty allocator
+# calls and stabilizes stride/pointer values across the Triton JIT cache.
+_SCRATCH_CACHE: dict = {}
+# Cache a converted-to-int32 view of the class_mapping tensor. The upstream
+# model stores it as int64, but our Triton kernel needs int32; without a
+# cache we relaunch direct_copy_kernel_cuda every frame.
+_CLASS_MAPPING_INT32_CACHE: dict = {}
+
+
+def _get_scratch_buffers(num_queries: int, device: torch.device):
+    key = (num_queries, device)
+    cached = _SCRATCH_CACHE.get(key)
+    if cached is None:
+        combined = torch.empty((num_queries, 6), dtype=torch.int32, device=device)
+        survivor_idx = torch.empty((num_queries,), dtype=torch.int32, device=device)
+        mask_any = torch.empty((num_queries,), dtype=torch.int32, device=device)
+        counter = torch.zeros((1,), dtype=torch.int32, device=device)
+        cached = (combined, survivor_idx, mask_any, counter)
+        _SCRATCH_CACHE[key] = cached
+    return cached
+
+
+def _get_class_mapping_int32(class_mapping: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if class_mapping.dtype == torch.int32 and class_mapping.device == device and class_mapping.is_contiguous():
+        return class_mapping
+    key = (id(class_mapping), device)
+    cached = _CLASS_MAPPING_INT32_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cached = class_mapping.to(dtype=torch.int32, device=device).contiguous()
+    _CLASS_MAPPING_INT32_CACHE[key] = cached
+    return cached
 
 
 def _get_mask_bin_buffer(
@@ -378,25 +411,27 @@ def triton_rfdetr_fullpost(
     bboxes_2d = bboxes[0] if bboxes[0].is_contiguous() else bboxes[0].contiguous()
     masks_3d = masks[0] if masks[0].is_contiguous() else masks[0].contiguous()
 
-    # Single combined int32 output buffer for all per-survivor scalar fields
-    # (xyxy [4] + conf_as_i32 + class_id = 6 int32 per slot). Reduces 3-4
-    # separate small .cpu() transfers at the adapter level to one.
-    combined = torch.empty((num_queries, 6), dtype=torch.int32, device=device)
-    survivor_idx = torch.empty((num_queries,), dtype=torch.int32, device=device)
-    mask_any = torch.empty((num_queries,), dtype=torch.int32, device=device)
-    # Atomic counter — must be zeroed each call since the filter kernel
-    # atomic_adds into it.
-    counter = torch.zeros((1,), dtype=torch.int32, device=device)
+    # Reuse persistent scratch across frames. Avoids 3 torch.empty allocator
+    # calls per frame and keeps all downstream .stride() / pointer values
+    # stable across the Triton JIT cache.
+    combined, survivor_idx, mask_any, counter = _get_scratch_buffers(
+        num_queries, device
+    )
+    # Reset the atomic counter. zero_() still launches FillFunctor (2.5 µs on
+    # T4), but there's no safe way to inline this into the filter kernel —
+    # concurrent blocks would race with the zero. mask_any is re-initialized
+    # by the filter kernel itself (per-slot store), survivor_idx is fully
+    # overwritten, combined is fully overwritten.
+    counter.zero_()
 
     thr_tensor, per_class = _prepare_threshold(threshold, device, num_classes)
 
     if class_mapping is not None:
         has_remap = True
-        cmap = class_mapping if (
-            class_mapping.dtype == torch.int32
-            and class_mapping.device == device
-            and class_mapping.is_contiguous()
-        ) else class_mapping.to(dtype=torch.int32, device=device).contiguous()
+        # Cache the int32 view — upstream model stores class_mapping as int64
+        # and the naïve .to(dtype=torch.int32) would launch direct_copy_kernel
+        # every frame.
+        cmap = _get_class_mapping_int32(class_mapping, device)
     else:
         has_remap = False
         cmap = _EMPTY_INT32.to(device, non_blocking=True)
