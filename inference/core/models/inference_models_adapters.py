@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 from io import BytesIO
 from time import perf_counter
 from typing import Any, List, Optional, Tuple, Union
@@ -308,17 +309,45 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         detections_list = self._model.post_process(
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
+        gpu_fastpath = os.getenv("RFDETR_GPU_POSTPROCESS", "true").lower() in ("true", "1")
 
         responses: List[InstanceSegmentationInferenceResponse] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):
             H = preproc_metadata.original_size.height
             W = preproc_metadata.original_size.width
 
-            xyxy = det.xyxy.detach().cpu().numpy()
-            confs = det.confidence.detach().cpu().numpy()
-            masks = det.mask.detach().cpu().numpy()
-            polys = masks2poly(masks)
-            class_ids = det.class_id.detach().cpu().numpy()
+            if gpu_fastpath and det.mask.is_cuda and det.mask.numel() > 0:
+                mask_any_gpu = det.mask.any(dim=(1, 2))
+                xyxy = det.xyxy.detach().cpu().numpy()
+                confs = det.confidence.detach().cpu().numpy()
+                class_ids = det.class_id.detach().cpu().numpy()
+                mask_any = mask_any_gpu.cpu().numpy()
+                nonempty_idx = mask_any.nonzero()[0]
+                if nonempty_idx.size > 0:
+                    masks_nonempty = (
+                        det.mask[torch.as_tensor(nonempty_idx, device=det.mask.device)]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    polys_nonempty = masks2poly(masks_nonempty)
+                else:
+                    polys_nonempty = []
+                empty_poly = [np.zeros((0, 2), dtype=np.float32)]
+                polys = []
+                j = 0
+                for has in mask_any:
+                    if has:
+                        polys.append(polys_nonempty[j])
+                        j += 1
+                    else:
+                        polys.append(empty_poly)
+            else:
+                xyxy = det.xyxy.detach().cpu().numpy()
+                confs = det.confidence.detach().cpu().numpy()
+                masks = det.mask.detach().cpu().numpy()
+                polys = masks2poly(masks)
+                class_ids = det.class_id.detach().cpu().numpy()
 
             predictions: List[InstanceSegmentationPrediction] = []
 

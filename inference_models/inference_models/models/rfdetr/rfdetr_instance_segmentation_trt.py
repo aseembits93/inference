@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import List, Optional, Tuple, Union
 
@@ -48,8 +49,30 @@ from inference_models.models.rfdetr.common import (
     post_process_instance_segmentation_results,
 )
 from inference_models.models.rfdetr.pre_processing import pre_process_network_input
+from inference_models.entities import ImageDimensions as _ImageDimensions
+from inference_models.models.common.roboflow.model_packages import (
+    StaticCropOffset as _StaticCropOffset,
+)
 from inference_models.models.common.roboflow.post_processing import ConfidenceFilter
 from inference_models.weights_providers.entities import RecommendedParameters
+
+_RFDETR_USE_TRITON_PREPROC = os.getenv("RFDETR_USE_TRITON_PREPROC", "false").lower() in (
+    "true",
+    "1",
+)
+if _RFDETR_USE_TRITON_PREPROC:
+    try:
+        from inference_models.models.rfdetr.triton_preprocess import (
+            TRITON_AVAILABLE as _TRITON_AVAILABLE,
+            triton_preprocess_rfdetr_stretch,
+        )
+        _TRITON_READY = _TRITON_AVAILABLE and torch.cuda.is_available()
+    except Exception:  # pragma: no cover
+        _TRITON_READY = False
+        triton_preprocess_rfdetr_stretch = None
+else:
+    _TRITON_READY = False
+    triton_preprocess_rfdetr_stretch = None
 
 try:
     import tensorrt as trt
@@ -230,6 +253,14 @@ class RFDetrForInstanceSegmentationTRT(
         pre_processing_overrides: Optional[PreProcessingOverrides] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, List[PreProcessingMetadata]]:
+        fast = self._try_fast_preprocess(
+            images=images,
+            input_color_format=input_color_format,
+            image_size=image_size,
+            pre_processing_overrides=pre_processing_overrides,
+        )
+        if fast is not None:
+            return fast
         with torch.cuda.stream(self._pre_process_stream):
             pre_processed_images, pre_processing_meta = pre_process_network_input(
                 images=images,
@@ -243,6 +274,111 @@ class RFDetrForInstanceSegmentationTRT(
         self._pre_process_stream.synchronize()
         return pre_processed_images, pre_processing_meta
 
+    def _try_fast_preprocess(
+        self,
+        images,
+        input_color_format,
+        image_size,
+        pre_processing_overrides,
+    ):
+        if not _TRITON_READY:
+            return None
+        if image_size is not None:
+            return None
+        ipp = self._inference_config.image_pre_processing
+        if (
+            ipp.static_crop is not None
+            and ipp.static_crop.enabled
+            or ipp.contrast is not None
+            and ipp.contrast.enabled
+            or ipp.grayscale is not None
+            and ipp.grayscale.enabled
+        ):
+            return None
+        ni = self._inference_config.network_input
+        if ni.resize_mode != ResizeMode.STRETCH_TO:
+            return None
+        if ni.input_channels != 3:
+            return None
+        if ni.dataset_version_resize_dimensions is not None:
+            return None
+        if ni.scaling_factor not in (None, 255):
+            return None
+        if ni.normalization is None:
+            return None
+        means, stds = ni.normalization
+        # Only handle numpy HWC BGR uint8 (the common hot path).
+        if isinstance(images, list):
+            if len(images) != 1:
+                return None
+            candidate = images[0]
+        else:
+            candidate = images
+        if not isinstance(candidate, np.ndarray):
+            return None
+        if (
+            candidate.dtype != np.uint8
+            or candidate.ndim != 3
+            or candidate.shape[2] != 3
+        ):
+            return None
+        images = candidate
+        # Color: if caller says RGB, skip; we do BGR->model_color_mode.
+        from inference_models.models.common.roboflow.model_packages import ColorMode
+        caller_mode = ColorMode(input_color_format) if input_color_format is not None else ColorMode.BGR
+        if caller_mode != ColorMode.BGR or ni.color_mode != ColorMode.RGB:
+            return None
+
+        target_h = ni.training_input_size.height
+        target_w = ni.training_input_size.width
+        orig_h, orig_w = images.shape[0], images.shape[1]
+
+        if not getattr(self, "_fast_buffer_initialized", False):
+            self._fast_input_buffer = torch.empty(
+                (1, 3, target_h, target_w),
+                dtype=torch.float32,
+                device=self._device,
+            )
+            self._fast_means = tuple(means)
+            self._fast_stds = tuple(stds)
+            self._fast_buffer_initialized = True
+
+        with torch.cuda.stream(self._pre_process_stream):
+            src_gpu = torch.from_numpy(np.ascontiguousarray(images)).to(
+                self._device, non_blocking=True
+            )
+            triton_preprocess_rfdetr_stretch(
+                src_gpu,
+                target_h=target_h,
+                target_w=target_w,
+                means=self._fast_means,
+                stds=self._fast_stds,
+                out=self._fast_input_buffer,
+            )
+            # Record an event so the inference stream can wait on preproc
+            # completion without blocking the CPU.
+            self._fast_preproc_event = torch.cuda.Event()
+            self._fast_preproc_event.record(self._pre_process_stream)
+            self._fast_input_buffer.record_stream(self._pre_process_stream)
+
+        size_after = _ImageDimensions(height=orig_h, width=orig_w)
+        target = _ImageDimensions(height=target_h, width=target_w)
+        metadata = PreProcessingMetadata(
+            pad_left=0,
+            pad_top=0,
+            pad_right=0,
+            pad_bottom=0,
+            original_size=size_after,
+            size_after_pre_processing=size_after,
+            inference_size=target,
+            scale_width=target_w / orig_w,
+            scale_height=target_h / orig_h,
+            static_crop_offset=_StaticCropOffset(
+                offset_x=0, offset_y=0, crop_width=orig_w, crop_height=orig_h
+            ),
+        )
+        return self._fast_input_buffer, [metadata]
+
     def forward(
         self,
         pre_processed_images: torch.Tensor,
@@ -250,6 +386,10 @@ class RFDetrForInstanceSegmentationTRT(
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cache = self._trt_cuda_graph_cache if not disable_cuda_graphs else None
+        ev = getattr(self, "_fast_preproc_event", None)
+        if ev is not None:
+            ev.wait(self._inference_stream)
+            self._fast_preproc_event = None
         with self._lock:
             with use_cuda_context(context=self._cuda_context):
                 detections, labels, masks = infer_from_trt_engine(
@@ -290,7 +430,6 @@ class RFDetrForInstanceSegmentationTRT(
                 num_classes=len(self.class_names),
                 classes_re_mapping=self._classes_re_mapping,
             )
-        self._post_process_stream.synchronize()
         return results
 
     @property
