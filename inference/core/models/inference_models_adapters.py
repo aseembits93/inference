@@ -316,43 +316,15 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             H = preproc_metadata.original_size.height
             W = preproc_metadata.original_size.width
 
-            if gpu_fastpath and det.mask.is_cuda and det.mask.numel() > 0:
-                # Use precomputed mask_any if available (Triton full-fusion path).
-                precomputed_any = getattr(det, "mask_any", None)
-                if precomputed_any is None:
-                    mask_any_gpu = det.mask.any(dim=(1, 2))
-                else:
-                    mask_any_gpu = precomputed_any
-                xyxy = det.xyxy.detach().cpu().numpy()
-                confs = det.confidence.detach().cpu().numpy()
-                class_ids = det.class_id.detach().cpu().numpy()
-                mask_any = mask_any_gpu.cpu().numpy()
-                nonempty_idx = mask_any.nonzero()[0]
-                if nonempty_idx.size > 0:
-                    masks_nonempty = (
-                        det.mask[torch.as_tensor(nonempty_idx, device=det.mask.device)]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
-                    polys_nonempty = masks2poly(masks_nonempty)
-                else:
-                    polys_nonempty = []
-                empty_poly = [np.zeros((0, 2), dtype=np.float32)]
-                polys = []
-                j = 0
-                for has in mask_any:
-                    if has:
-                        polys.append(polys_nonempty[j])
-                        j += 1
-                    else:
-                        polys.append(empty_poly)
-            else:
-                xyxy = det.xyxy.detach().cpu().numpy()
-                confs = det.confidence.detach().cpu().numpy()
-                masks = det.mask.detach().cpu().numpy()
-                polys = masks2poly(masks)
-                class_ids = det.class_id.detach().cpu().numpy()
+            # The triton_rfdetr_fullpost path returns compact tensors (rows =
+            # surviving detections), so there's no padding to filter out.
+            # masks2poly already fast-skips empty masks internally, so we
+            # don't need a GPU-side .any() + masked_select dance.
+            xyxy = det.xyxy.detach().cpu().numpy()
+            confs = det.confidence.detach().cpu().numpy()
+            class_ids = det.class_id.detach().cpu().numpy()
+            masks = det.mask.detach().cpu().numpy()
+            polys = masks2poly(masks)
 
             predictions: List[InstanceSegmentationPrediction] = []
 

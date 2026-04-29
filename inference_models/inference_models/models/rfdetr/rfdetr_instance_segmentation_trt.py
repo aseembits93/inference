@@ -417,7 +417,14 @@ class RFDetrForInstanceSegmentationTRT(
             recommended_parameters=self.recommended_parameters,
             default_confidence=INFERENCE_MODELS_RFDETR_DEFAULT_CONFIDENCE,
         )
+        # Wait on the TRT-stream "produce" event so our post_process stream
+        # can start reading the (graph-owned) output buffers as soon as the
+        # engine finishes, without a CPU-side synchronize().
+        produce_event = getattr(model_results[0], "_trt_produce_event", None)
+        graph_state = getattr(model_results[0], "_trt_graph_state", None)
         with torch.cuda.stream(self._post_process_stream):
+            if produce_event is not None:
+                produce_event.wait(self._post_process_stream)
             for result_element in model_results:
                 result_element.record_stream(self._post_process_stream)
             bboxes, logits, masks = model_results
@@ -430,6 +437,14 @@ class RFDetrForInstanceSegmentationTRT(
                 num_classes=len(self.class_names),
                 classes_re_mapping=self._classes_re_mapping,
             )
+            # Record "consumer done" so the next TRT replay can wait on it
+            # before overwriting the graph-owned output buffers.
+            if graph_state is not None:
+                ev = graph_state.consumer_done_event
+                if ev is None:
+                    ev = torch.cuda.Event()
+                    graph_state.consumer_done_event = ev
+                ev.record(self._post_process_stream)
         return results
 
     @property

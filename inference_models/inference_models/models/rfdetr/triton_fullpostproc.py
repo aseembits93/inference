@@ -44,11 +44,13 @@ if TRITON_AVAILABLE:
         bboxes_ptr,          # (num_queries, 4) fp32, normalized cxcywh
         threshold_ptr,       # scalar or (num_remapped,) fp32
         class_map_ptr,       # (num_classes_total,) int32; -1 means drop
-        # outputs
-        xyxy_out_ptr,        # (num_queries, 4) int32 — scaled + rounded
+        # compact outputs (pre-sized to num_queries; host reads counter to slice)
+        xyxy_out_ptr,        # (num_queries, 4) int32
         conf_out_ptr,        # (num_queries,) fp32
         class_out_ptr,       # (num_queries,) int32
-        keep_out_ptr,        # (num_queries,) int8
+        survivor_idx_out_ptr,# (num_queries,) int32 — original query id of each survivor
+        mask_any_out_ptr,    # (num_queries,) int32 — zeroed at compact slot; mask kernel atomic_maxes up to 1
+        counter_ptr,         # (1,) int32 — atomic counter; host reads to get n_survivors
         # static scalars
         num_queries,
         num_classes_total,
@@ -56,7 +58,7 @@ if TRITON_AVAILABLE:
         inference_h,
         pad_left,
         pad_top,
-        inv_scale_w,         # 1/scale_width = orig_w / eff_w
+        inv_scale_w,
         inv_scale_h,
         orig_w,
         orig_h,
@@ -72,7 +74,6 @@ if TRITON_AVAILABLE:
         offs_c = tl.arange(0, BLOCK_C)
         mask_c = offs_c < num_classes_total
 
-        # --- 1. argmax over classes + sigmoid(max) ---
         logits_row = tl.load(
             logits_ptr + pid * logits_stride_q + offs_c,
             mask=mask_c,
@@ -89,67 +90,69 @@ if TRITON_AVAILABLE:
             valid = top_c >= 0
         else:
             top_c = raw_c
-            valid = raw_c < num_classes_total  # caller guarantees num_classes==num_classes_total if no remap
+            valid = raw_c < num_classes_total
 
-        # Numerically stable sigmoid.
         abs_max = tl.abs(max_val)
         z = tl.exp(-abs_max)
         sig_pos = 1.0 / (1.0 + z)
         sig_neg = z / (1.0 + z)
         conf = tl.where(max_val >= 0.0, sig_pos, sig_neg)
 
-        # --- 2. threshold ---
         if PER_CLASS:
             safe_c = tl.where(valid, top_c, 0)
             thr = tl.load(threshold_ptr + safe_c)
         else:
-            thr = tl.load(threshold_ptr)  # scalar stored as single-elem tensor
+            thr = tl.load(threshold_ptr)
         keep = valid & (conf > thr)
 
-        # --- 3. box denorm: normalized cxcywh (in [0,1]) -> xyxy in orig image ---
-        # First denormalize to inference (preprocessed) image coords.
+        # Early exit for filtered queries — don't compute boxes, don't
+        # reserve a slot. Cheap (rest of kernel is ~8 FLOPS + 4 stores).
+        if not keep:
+            return
+
         cx = tl.load(bboxes_ptr + pid * bboxes_stride_q + 0) * inference_w
         cy = tl.load(bboxes_ptr + pid * bboxes_stride_q + 1) * inference_h
         w_half = tl.load(bboxes_ptr + pid * bboxes_stride_q + 2) * inference_w * 0.5
         h_half = tl.load(bboxes_ptr + pid * bboxes_stride_q + 3) * inference_h * 0.5
 
-        x1 = cx - w_half
-        y1 = cy - h_half
-        x2 = cx + w_half
-        y2 = cy + h_half
+        x1 = cx - w_half - pad_left
+        y1 = cy - h_half - pad_top
+        x2 = cx + w_half - pad_left
+        y2 = cy + h_half - pad_top
 
-        # Subtract letterbox padding (always 0 for STRETCH_TO, but general).
-        x1 = x1 - pad_left
-        y1 = y1 - pad_top
-        x2 = x2 - pad_left
-        y2 = y2 - pad_top
-
-        # Divide by scale -> original image coords.
         x1 = x1 * inv_scale_w
         y1 = y1 * inv_scale_h
         x2 = x2 * inv_scale_w
         y2 = y2 * inv_scale_h
 
-        # Clip + round-to-int (matches `aligned_boxes.round().int()` in common.py).
         x1 = tl.maximum(tl.minimum(x1, orig_w), 0.0)
         y1 = tl.maximum(tl.minimum(y1, orig_h), 0.0)
         x2 = tl.maximum(tl.minimum(x2, orig_w), 0.0)
         y2 = tl.maximum(tl.minimum(y2, orig_h), 0.0)
-        # Banker's rounding to match torch.round semantics on .5 ties is not
-        # required here; detection boxes near a half-pixel are rare and the
-        # downstream client doesn't distinguish. Use floor(x + 0.5).
+
         x1_i = tl.floor(x1 + 0.5).to(tl.int32)
         y1_i = tl.floor(y1 + 0.5).to(tl.int32)
         x2_i = tl.floor(x2 + 0.5).to(tl.int32)
         y2_i = tl.floor(y2 + 0.5).to(tl.int32)
 
-        tl.store(xyxy_out_ptr + pid * 4 + 0, x1_i)
-        tl.store(xyxy_out_ptr + pid * 4 + 1, y1_i)
-        tl.store(xyxy_out_ptr + pid * 4 + 2, x2_i)
-        tl.store(xyxy_out_ptr + pid * 4 + 3, y2_i)
-        tl.store(conf_out_ptr + pid, conf)
-        tl.store(class_out_ptr + pid, top_c)
-        tl.store(keep_out_ptr + pid, keep.to(tl.int8))
+        # Reserve a compact slot via atomic-add. Order is non-deterministic
+        # across survivors but downstream doesn't require query-order.
+        slot = tl.atomic_add(counter_ptr, 1)
+
+        tl.store(xyxy_out_ptr + slot * 4 + 0, x1_i)
+        tl.store(xyxy_out_ptr + slot * 4 + 1, y1_i)
+        tl.store(xyxy_out_ptr + slot * 4 + 2, x2_i)
+        tl.store(xyxy_out_ptr + slot * 4 + 3, y2_i)
+        tl.store(conf_out_ptr + slot, conf)
+        tl.store(class_out_ptr + slot, top_c)
+        tl.store(survivor_idx_out_ptr + slot, pid.to(tl.int32))
+        # Initialize mask_any[slot] to 0 here. Later the mask kernel's
+        # tile-level atomic_max will raise it to 1 if any pixel passes the
+        # threshold. The filter kernel writes `slot` monotonically (atomic_add
+        # returns unique values), and the entire filter kernel completes
+        # before the mask kernel is launched (serialized on the stream), so
+        # this store always lands first.
+        tl.store(mask_any_out_ptr + slot, 0)
 
 
     @triton.jit
@@ -237,6 +240,52 @@ def _next_pow2(n: int) -> int:
     return p
 
 
+# Cache small supporting tensors so we don't incur HtoD for them per frame.
+_THRESHOLD_CACHE: dict = {}
+_EMPTY_INT32 = torch.empty((1,), dtype=torch.int32)
+_MASK_ANY_BUFFER_CACHE: dict = {}
+
+
+def _get_mask_any_buffer(capacity: int, device: torch.device) -> torch.Tensor:
+    """Return a pre-zeroed reusable int32 buffer for mask_any. Avoids a
+    torch.zeros kernel launch per frame. Caller must not assume other
+    frames haven't written to unused indices — caller slices [:n_survivors]
+    and only reads values we wrote.
+
+    We clear (zero_) the slice we hand out using a kernel launch the first
+    time we see a capacity, then on subsequent calls just return the same
+    buffer after a cheap view — no zero_() needed because the mask kernel's
+    atomic_max starts from whatever's there.
+
+    Correctness hinges on: atomic_max(x, 0) is a no-op. So if the previous
+    frame left this slot at 1, the atomic_max(..., tile_any) can't lower it
+    to 0. We must zero before use. Implementation: keep zero_() but only
+    on the slice we use, not the whole buffer.
+    """
+    key = (capacity, device)
+    buf = _MASK_ANY_BUFFER_CACHE.get(key)
+    if buf is None:
+        buf = torch.zeros(capacity, dtype=torch.int32, device=device)
+        _MASK_ANY_BUFFER_CACHE[key] = buf
+    return buf
+
+
+def _prepare_threshold(threshold, device: torch.device, num_classes: int):
+    """Return (threshold_tensor_on_device, per_class_flag), caching the tensor
+    form of scalar thresholds so we don't ship a 4-byte HtoD every frame."""
+    if isinstance(threshold, torch.Tensor):
+        t = threshold
+        if t.dtype != torch.float32 or t.device != device or not t.is_contiguous():
+            t = t.to(dtype=torch.float32, device=device).contiguous()
+        return t, True
+    key = (float(threshold), device)
+    cached = _THRESHOLD_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor([float(threshold)], dtype=torch.float32, device=device)
+        _THRESHOLD_CACHE[key] = cached
+    return cached, False
+
+
 def triton_rfdetr_fullpost(
     bboxes: torch.Tensor,                  # (B=1, num_queries, 4) fp32 normalized cxcywh
     logits: torch.Tensor,                  # (B=1, num_queries, num_classes_total) fp32/fp16
@@ -267,30 +316,39 @@ def triton_rfdetr_fullpost(
     num_queries, num_classes_total = logits.shape[1], logits.shape[2]
     _, _, mask_h, mask_w = masks.shape
 
-    # Flatten batch dim.
-    logits_2d = logits[0].contiguous()
-    bboxes_2d = bboxes[0].contiguous()
-    masks_3d = masks[0].contiguous()
+    # Flatten batch dim — these views are contiguous when batch=1 and the
+    # tensor came straight from TRT engine outputs, so .contiguous() is a
+    # no-op in the common case. Still call it to be defensive; torch skips
+    # the kernel launch when the view is already contiguous.
+    logits_2d = logits[0] if logits[0].is_contiguous() else logits[0].contiguous()
+    bboxes_2d = bboxes[0] if bboxes[0].is_contiguous() else bboxes[0].contiguous()
+    masks_3d = masks[0] if masks[0].is_contiguous() else masks[0].contiguous()
 
+    # Compact outputs, pre-sized to max (num_queries). Host reads the counter
+    # to know how many slots are populated.
     xyxy = torch.empty((num_queries, 4), dtype=torch.int32, device=device)
     conf = torch.empty((num_queries,), dtype=torch.float32, device=device)
     cls_id = torch.empty((num_queries,), dtype=torch.int32, device=device)
-    keep = torch.empty((num_queries,), dtype=torch.int8, device=device)
+    survivor_idx = torch.empty((num_queries,), dtype=torch.int32, device=device)
+    # mask_any is written (not read) by the filter kernel at each survivor's
+    # slot -> 0. Mask kernel later atomic_maxes up to 1. No pre-zero needed.
+    mask_any = torch.empty((num_queries,), dtype=torch.int32, device=device)
+    # Atomic counter — must be zeroed each call since the filter kernel
+    # atomic_adds into it.
+    counter = torch.zeros((1,), dtype=torch.int32, device=device)
 
-    if isinstance(threshold, torch.Tensor):
-        per_class = True
-        thr_tensor = threshold.contiguous().to(dtype=torch.float32, device=device)
-    else:
-        per_class = False
-        # Store scalar as single-element tensor so the kernel can tl.load it.
-        thr_tensor = torch.tensor([float(threshold)], dtype=torch.float32, device=device)
+    thr_tensor, per_class = _prepare_threshold(threshold, device, num_classes)
 
     if class_mapping is not None:
         has_remap = True
-        cmap = class_mapping.to(dtype=torch.int32, device=device).contiguous()
+        cmap = class_mapping if (
+            class_mapping.dtype == torch.int32
+            and class_mapping.device == device
+            and class_mapping.is_contiguous()
+        ) else class_mapping.to(dtype=torch.int32, device=device).contiguous()
     else:
         has_remap = False
-        cmap = torch.empty((1,), dtype=torch.int32, device=device)
+        cmap = _EMPTY_INT32.to(device, non_blocking=True)
 
     inf_w, inf_h = inference_size_wh
     pad_l, pad_t, _, _ = pad_ltrb
@@ -306,7 +364,9 @@ def triton_rfdetr_fullpost(
         xyxy,
         conf,
         cls_id,
-        keep,
+        survivor_idx,
+        mask_any,
+        counter,
         num_queries,
         num_classes_total,
         int(inf_w),
@@ -324,33 +384,31 @@ def triton_rfdetr_fullpost(
         BLOCK_C=BLOCK_C,
     )
 
-    # Compact survivors on GPU. Single nonzero() call — this is the only
-    # DtoH sync in the fused path (required to size the mask kernel grid).
-    keep_bool = keep.bool()
-    survivor_idx = keep_bool.nonzero(as_tuple=False).squeeze(-1).to(torch.int32)
-    n_survivors = int(survivor_idx.shape[0])
+    # Single DtoH: read the atomic counter. This is the only sync in the
+    # post-process path.
+    n_survivors = int(counter.item())
 
-    # Compact outputs: size them to n_survivors, not num_queries.
     if n_survivors == 0:
-        empty_xyxy = torch.empty((0, 4), dtype=torch.int32, device=device)
-        empty_conf = torch.empty((0,), dtype=torch.float32, device=device)
-        empty_cls = torch.empty((0,), dtype=torch.int32, device=device)
-        empty_mask = torch.empty((0, orig_h, orig_w), dtype=torch.uint8, device=device)
-        empty_any = torch.empty((0,), dtype=torch.bool, device=device)
-        return empty_xyxy, empty_conf, empty_cls, empty_mask, empty_any
+        return (
+            xyxy[:0],
+            conf[:0],
+            cls_id[:0],
+            torch.empty((0, orig_h, orig_w), dtype=torch.uint8, device=device),
+            torch.empty((0,), dtype=torch.bool, device=device),
+        )
 
-    # Gather the scalar fields into compact survivor-size tensors.
-    # These use torch's vectorized_gather which is very cheap for tiny tensors.
-    xyxy_compact = xyxy.index_select(0, survivor_idx.long())
-    conf_compact = conf.index_select(0, survivor_idx.long())
-    cls_compact = cls_id.index_select(0, survivor_idx.long())
+    # Views into the first n_survivors slots (no copy).
+    xyxy_compact = xyxy[:n_survivors]
+    conf_compact = conf[:n_survivors]
+    cls_compact = cls_id[:n_survivors]
+    survivor_idx_view = survivor_idx[:n_survivors]
 
-    # Mask output sized to survivors.
     mask_bin = torch.empty(
         (n_survivors, orig_h, orig_w), dtype=torch.uint8, device=device
     )
-    # mask_any accumulated via tile-wise atomic_max; must be pre-zeroed.
-    mask_any = torch.zeros((n_survivors,), dtype=torch.int32, device=device)
+    # mask_any was zero-initialized inside the filter kernel for each
+    # compact slot; just take the view for the mask kernel to atomic_max into.
+    mask_any_view = mask_any[:n_survivors]
 
     BLOCK_H = 16
     BLOCK_W = 16
@@ -361,9 +419,9 @@ def triton_rfdetr_fullpost(
     )
     _rfdetr_fullpost_mask_kernel_compact[grid](
         masks_3d,
-        survivor_idx,
+        survivor_idx_view,
         mask_bin,
-        mask_any,
+        mask_any_view,
         int(mask_h),
         int(mask_w),
         int(orig_h),
@@ -378,4 +436,4 @@ def triton_rfdetr_fullpost(
         BLOCK_W=BLOCK_W,
     )
 
-    return xyxy_compact, conf_compact, cls_compact, mask_bin, mask_any.bool()
+    return xyxy_compact, conf_compact, cls_compact, mask_bin, mask_any_view.bool()

@@ -78,6 +78,10 @@ class TRTCudaGraphState:
     input_buffer: torch.Tensor
     output_buffers: List[torch.Tensor]
     execution_context: trt.IExecutionContext
+    # Consumers of output_buffers can record into this event; the next graph
+    # replay will wait on it to avoid overwriting the previous frame's outputs.
+    # None until first consumer records an event.
+    consumer_done_event: Optional["torch.cuda.Event"] = None
 
 
 class TRTCudaGraphCache:
@@ -571,7 +575,17 @@ def infer_from_trt_engine(
             outputs=outputs,
             trt_cuda_graph_cache=trt_cuda_graph_cache,
         )
-    stream.synchronize()
+    # Graph-replay path: record the event on the graph's own stream so
+    # downstream can wait on the correct stream (the graph captures on a
+    # dedicated stream, not `stream`). Non-graph path: record on `stream`.
+    if hasattr(results[0], "_trt_graph_state"):
+        graph_state = results[0]._trt_graph_state
+        produce_event = torch.cuda.Event()
+        produce_event.record(graph_state.cuda_stream)
+    else:
+        produce_event = torch.cuda.Event()
+        produce_event.record(stream)
+    results[0]._trt_produce_event = produce_event
     return results
 
 
@@ -705,11 +719,20 @@ def _execute_trt_engine(
         else:
             trt_cuda_graph_state = trt_cuda_graph_cache[cache_key]
             stream = trt_cuda_graph_state.cuda_stream
+            # Before re-running the graph, make sure any consumer of the
+            # previous frame's outputs is done. Post-process callers that read
+            # the output buffers directly must record into consumer_done_event.
+            consumer_done = trt_cuda_graph_state.consumer_done_event
+            if consumer_done is not None:
+                consumer_done.wait(stream)
             with torch.cuda.stream(stream):
                 trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
                 trt_cuda_graph_state.cuda_graph.replay()
-                results = [buf.clone() for buf in trt_cuda_graph_state.output_buffers]
-            stream.synchronize()
+            # Return graph-owned output buffers directly — no clone. Attach
+            # the graph state as a side-channel so consumers can record into
+            # consumer_done_event without plumbing the cache through.
+            results = list(trt_cuda_graph_state.output_buffers)
+            results[0]._trt_graph_state = trt_cuda_graph_state
             return results
 
     else:
