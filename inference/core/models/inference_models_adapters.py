@@ -9,6 +9,26 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+
+# Cache of pinned host buffers for async DtoH, keyed by (name, dtype).
+# Pinned memory lets torch's copy_(non_blocking=True) actually run async.
+# We grow on first use and reuse thereafter; buffer is sliced to the
+# current n_survivors for each copy.
+_PINNED_HOST_BUFFERS: dict = {}
+
+
+def _get_pinned_buffer(name: str, shape, dtype: torch.dtype) -> torch.Tensor:
+    shape = tuple(int(s) for s in shape)
+    key = (name, dtype)
+    buf = _PINNED_HOST_BUFFERS.get(key)
+    if buf is not None:
+        # Reuse if the cached buffer is at least as large in every dim.
+        if all(buf.shape[i] >= shape[i] for i in range(len(shape))):
+            return buf[tuple(slice(0, s) for s in shape)]
+    buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+    _PINNED_HOST_BUFFERS[key] = buf
+    return buf
+
 from inference.core.entities.requests import (
     ClassificationInferenceRequest,
     InferenceRequest,
@@ -316,38 +336,68 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             H = preproc_metadata.original_size.height
             W = preproc_metadata.original_size.width
 
-            if gpu_fastpath and det.mask.is_cuda and det.mask.numel() > 0:
-                mask_any_gpu = det.mask.any(dim=(1, 2))
-                xyxy = det.xyxy.detach().cpu().numpy()
-                confs = det.confidence.detach().cpu().numpy()
-                class_ids = det.class_id.detach().cpu().numpy()
-                mask_any = mask_any_gpu.cpu().numpy()
-                nonempty_idx = mask_any.nonzero()[0]
-                if nonempty_idx.size > 0:
-                    masks_nonempty = (
-                        det.mask[torch.as_tensor(nonempty_idx, device=det.mask.device)]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
-                    polys_nonempty = masks2poly(masks_nonempty)
+            # Fast path: triton_rfdetr_fullpost returns UNSLICED buffers plus
+            # a GPU counter tensor and a done-event. We:
+            #   (1) wait the done-event on the current stream so post_process
+            #       stream writes are visible,
+            #   (2) async-DtoH the 4-byte counter into a pinned host buffer
+            #       and sync once — this replaces the old in-kernel
+            #       counter.item() that blocked the postproc stream,
+            #   (3) slice combined/mask to n_survivors and async-DtoH both,
+            #       then sync.
+            combined_gpu = getattr(det, "_combined_gpu", None)
+            counter_gpu = getattr(det, "_counter_gpu", None)
+            done_event = getattr(det, "_postproc_done_event", None)
+            if (
+                combined_gpu is not None
+                and counter_gpu is not None
+                and done_event is not None
+                and det.mask.is_cuda
+            ):
+                device = combined_gpu.device
+                stream = torch.cuda.current_stream(device)
+                done_event.wait(stream)
+
+                counter_host = _get_pinned_buffer("counter", (1,), torch.int32)
+                counter_host.copy_(counter_gpu, non_blocking=True)
+                stream.synchronize()
+                n_survivors = int(counter_host[0].item())
+
+                if n_survivors == 0:
+                    xyxy = np.empty((0, 4), dtype=np.int32)
+                    confs = np.empty((0,), dtype=np.float32)
+                    class_ids = np.empty((0,), dtype=np.int32)
+                    masks = np.empty((0, 0, 0), dtype=np.uint8)
                 else:
-                    polys_nonempty = []
-                empty_poly = [np.zeros((0, 2), dtype=np.float32)]
-                polys = []
-                j = 0
-                for has in mask_any:
-                    if has:
-                        polys.append(polys_nonempty[j])
-                        j += 1
-                    else:
-                        polys.append(empty_poly)
+                    mask_gpu = det.mask
+                    combined_slice = combined_gpu[:n_survivors]
+                    mask_slice = mask_gpu[:n_survivors]
+                    combined_host = _get_pinned_buffer(
+                        "combined", combined_slice.shape, combined_slice.dtype
+                    )
+                    mask_host = _get_pinned_buffer(
+                        "mask", mask_slice.shape, mask_slice.dtype
+                    )
+                    combined_host.copy_(combined_slice, non_blocking=True)
+                    mask_host.copy_(mask_slice, non_blocking=True)
+                    stream.synchronize()
+                    combined_cpu = combined_host.numpy()
+                    xyxy = combined_cpu[:, :4]
+                    confs = combined_cpu[:, 4].view(np.float32)
+                    class_ids = combined_cpu[:, 5]
+                    masks = mask_host.numpy()
+            elif combined_gpu is not None:
+                combined_cpu = combined_gpu.detach().cpu().numpy()
+                xyxy = combined_cpu[:, :4]
+                confs = combined_cpu[:, 4].view(np.float32)
+                class_ids = combined_cpu[:, 5]
+                masks = det.mask.detach().cpu().numpy()
             else:
                 xyxy = det.xyxy.detach().cpu().numpy()
                 confs = det.confidence.detach().cpu().numpy()
-                masks = det.mask.detach().cpu().numpy()
-                polys = masks2poly(masks)
                 class_ids = det.class_id.detach().cpu().numpy()
+                masks = det.mask.detach().cpu().numpy()
+            polys = masks2poly(masks)
 
             predictions: List[InstanceSegmentationPrediction] = []
 
