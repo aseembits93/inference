@@ -23,6 +23,24 @@ if _RFDETR_TRITON_POSTPROC:
 else:
     _TRITON_POSTPROC_READY = False
     triton_rfdetr_conf_filter = None
+
+_RFDETR_TRITON_FULLPOSTPROC = os.getenv("RFDETR_TRITON_FULLPOSTPROC", "false").lower() in (
+    "true",
+    "1",
+)
+if _RFDETR_TRITON_FULLPOSTPROC:
+    try:
+        from inference_models.models.rfdetr.triton_fullpostproc import (
+            TRITON_AVAILABLE as _TRITON_FULLPOST_AVAILABLE,
+            triton_rfdetr_fullpost,
+        )
+        _TRITON_FULLPOST_READY = _TRITON_FULLPOST_AVAILABLE and torch.cuda.is_available()
+    except Exception:
+        _TRITON_FULLPOST_READY = False
+        triton_rfdetr_fullpost = None
+else:
+    _TRITON_FULLPOST_READY = False
+    triton_rfdetr_fullpost = None
 from inference_models.entities import ImageDimensions
 from inference_models.errors import CorruptedModelPackageError
 from inference_models.models.common.roboflow.model_packages import (
@@ -72,6 +90,48 @@ def post_process_instance_segmentation_results(
 ) -> List[InstanceDetections]:
     results = []
     device = bboxes.device
+    # Try the full-fusion fast path first (batch=1, no static crop,
+    # no nonsquare-intermediate resize). Matches rfdetr-seg-nano default.
+    if (
+        _TRITON_FULLPOST_READY
+        and bboxes.is_cuda
+        and bboxes.shape[0] == 1
+        and len(pre_processing_meta) == 1
+        and pre_processing_meta[0].nonsquare_intermediate_size is None
+        and pre_processing_meta[0].static_crop_offset.offset_x == 0
+        and pre_processing_meta[0].static_crop_offset.offset_y == 0
+        and classes_re_mapping is not None
+    ):
+        meta = pre_processing_meta[0]
+        thr_arg = threshold if isinstance(threshold, torch.Tensor) else float(threshold)
+        combined, mask_bin, mask_any, counter, done_event = triton_rfdetr_fullpost(
+            bboxes=bboxes,
+            logits=logits,
+            masks=masks,
+            threshold=thr_arg,
+            num_classes=num_classes,
+            class_mapping=classes_re_mapping.class_mapping,
+            inference_size_wh=(meta.inference_size.width, meta.inference_size.height),
+            pad_ltrb=(meta.pad_left, meta.pad_top, meta.pad_right, meta.pad_bottom),
+            scale_wh=(meta.scale_width, meta.scale_height),
+            orig_size_wh=(meta.original_size.width, meta.original_size.height),
+        )
+        # Return UNSLICED buffers plus counter + done_event. The adapter does
+        # a pinned-host DtoH of counter alongside the combined/mask DtoHs on
+        # its own stream (guarded by done_event.wait), slicing the results
+        # host-side. That replaces the CPU-blocking counter.item() that would
+        # otherwise serialize the postproc stream with the adapter.
+        detections = InstanceDetections(
+            xyxy=combined[:, :4],
+            confidence=combined[:, 4],  # int32 bits; adapter bitcasts to fp32
+            class_id=combined[:, 5],
+            mask=mask_bin,
+        )
+        detections.__dict__["_combined_gpu"] = combined
+        detections.__dict__["_counter_gpu"] = counter
+        detections.__dict__["_postproc_done_event"] = done_event
+        results.append(detections)
+        return results
     use_triton = _TRITON_POSTPROC_READY and bboxes.is_cuda
     if isinstance(threshold, torch.Tensor):
         threshold_dtype = logits.dtype if use_triton else torch.float32
