@@ -44,10 +44,11 @@ if TRITON_AVAILABLE:
         bboxes_ptr,          # (num_queries, 4) fp32, normalized cxcywh
         threshold_ptr,       # scalar or (num_remapped,) fp32
         class_map_ptr,       # (num_classes_total,) int32; -1 means drop
-        # compact outputs (pre-sized to num_queries; host reads counter to slice)
-        xyxy_out_ptr,        # (num_queries, 4) int32
-        conf_out_ptr,        # (num_queries,) fp32
-        class_out_ptr,       # (num_queries,) int32
+        # SINGLE combined int32 output buffer. Layout:
+        #   offset 0..(num_queries*6): per-survivor [x1,y1,x2,y2,conf_i32,cls] records
+        #   (stored at stride 6 per slot; host reinterprets conf slot as fp32)
+        # Written by this kernel compactly via atomic_add(counter).
+        combined_out_ptr,    # (num_queries, 6) int32
         survivor_idx_out_ptr,# (num_queries,) int32 — original query id of each survivor
         mask_any_out_ptr,    # (num_queries,) int32 — zeroed at compact slot; mask kernel atomic_maxes up to 1
         counter_ptr,         # (1,) int32 — atomic counter; host reads to get n_survivors
@@ -139,19 +140,21 @@ if TRITON_AVAILABLE:
         # across survivors but downstream doesn't require query-order.
         slot = tl.atomic_add(counter_ptr, 1)
 
-        tl.store(xyxy_out_ptr + slot * 4 + 0, x1_i)
-        tl.store(xyxy_out_ptr + slot * 4 + 1, y1_i)
-        tl.store(xyxy_out_ptr + slot * 4 + 2, x2_i)
-        tl.store(xyxy_out_ptr + slot * 4 + 3, y2_i)
-        tl.store(conf_out_ptr + slot, conf)
-        tl.store(class_out_ptr + slot, top_c)
+        # Reinterpret conf (fp32) as int32 bits so we can write the whole
+        # record with int32 stores. Host side views the same memory as
+        # int32 and extracts conf via numpy view(np.float32).
+        conf_bits = conf.to(tl.float32, bitcast=False)  # no-op, already fp32
+        conf_i32 = conf_bits.to(tl.int32, bitcast=True)
+        base = slot * 6
+        tl.store(combined_out_ptr + base + 0, x1_i)
+        tl.store(combined_out_ptr + base + 1, y1_i)
+        tl.store(combined_out_ptr + base + 2, x2_i)
+        tl.store(combined_out_ptr + base + 3, y2_i)
+        tl.store(combined_out_ptr + base + 4, conf_i32)
+        tl.store(combined_out_ptr + base + 5, top_c)
         tl.store(survivor_idx_out_ptr + slot, pid.to(tl.int32))
-        # Initialize mask_any[slot] to 0 here. Later the mask kernel's
-        # tile-level atomic_max will raise it to 1 if any pixel passes the
-        # threshold. The filter kernel writes `slot` monotonically (atomic_add
-        # returns unique values), and the entire filter kernel completes
-        # before the mask kernel is launched (serialized on the stream), so
-        # this store always lands first.
+        # Initialize mask_any[slot] to 0. The mask kernel's tile-level
+        # atomic_max raises it to 1 if any pixel passes threshold.
         tl.store(mask_any_out_ptr + slot, 0)
 
 
@@ -303,14 +306,13 @@ def triton_rfdetr_fullpost(
     orig_size_wh: Tuple[int, int],         # (W, H) of the original image
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full RF-DETR post-process fused into two Triton launches. Returns
-    already-compacted (n_survivors,)-shaped outputs.
+    compact outputs sliced to n_survivors.
 
     Returns:
-        xyxy_int:  (n_survivors, 4) int32, rounded + clipped to orig image.
-        conf:      (n_survivors,) fp32
-        class_id:  (n_survivors,) int32 (remapped ids)
-        mask_bin:  (n_survivors, orig_h, orig_w) uint8 — already-binary
-        mask_any:  (n_survivors,) bool — True if mask has any non-zero pixel
+        combined:  (n_survivors, 6) int32 — per-survivor record
+                   [x1, y1, x2, y2, conf_as_i32_bits, class_id].
+        mask_bin:  (n_survivors, orig_h, orig_w) uint8.
+        mask_any:  (n_survivors,) int32 — 1 if any pixel passes threshold.
     """
     assert TRITON_AVAILABLE, "triton not available"
     assert bboxes.is_cuda and logits.is_cuda and masks.is_cuda
@@ -328,14 +330,11 @@ def triton_rfdetr_fullpost(
     bboxes_2d = bboxes[0] if bboxes[0].is_contiguous() else bboxes[0].contiguous()
     masks_3d = masks[0] if masks[0].is_contiguous() else masks[0].contiguous()
 
-    # Compact outputs, pre-sized to max (num_queries). Host reads the counter
-    # to know how many slots are populated.
-    xyxy = torch.empty((num_queries, 4), dtype=torch.int32, device=device)
-    conf = torch.empty((num_queries,), dtype=torch.float32, device=device)
-    cls_id = torch.empty((num_queries,), dtype=torch.int32, device=device)
+    # Single combined int32 output buffer for all per-survivor scalar fields
+    # (xyxy [4] + conf_as_i32 + class_id = 6 int32 per slot). Reduces 3-4
+    # separate small .cpu() transfers at the adapter level to one.
+    combined = torch.empty((num_queries, 6), dtype=torch.int32, device=device)
     survivor_idx = torch.empty((num_queries,), dtype=torch.int32, device=device)
-    # mask_any is written (not read) by the filter kernel at each survivor's
-    # slot -> 0. Mask kernel later atomic_maxes up to 1. No pre-zero needed.
     mask_any = torch.empty((num_queries,), dtype=torch.int32, device=device)
     # Atomic counter — must be zeroed each call since the filter kernel
     # atomic_adds into it.
@@ -365,9 +364,7 @@ def triton_rfdetr_fullpost(
         bboxes_2d,
         thr_tensor,
         cmap,
-        xyxy,
-        conf,
-        cls_id,
+        combined,
         survivor_idx,
         mask_any,
         counter,
@@ -421,24 +418,20 @@ def triton_rfdetr_fullpost(
         BLOCK_W=BLOCK_W,
     )
 
-    # Now read the counter. The sync happens after mask-kernel launch, not
-    # between it and the filter, so the two kernels pipeline on the GPU
-    # while the host waits.
+    # Read counter (syncs the postproc stream to current stream context).
+    # This must happen inside the postproc stream context that the caller
+    # has set up, otherwise .cpu()s issued on the default stream elsewhere
+    # will race with the Triton writes on this stream.
     n_survivors = int(counter.item())
 
     if n_survivors == 0:
-        return (
-            xyxy[:0],
-            conf[:0],
-            cls_id[:0],
-            torch.empty((0, orig_h, orig_w), dtype=torch.uint8, device=device),
-            torch.empty((0,), dtype=torch.bool, device=device),
-        )
+        empty_combined = torch.empty((0, 6), dtype=torch.int32, device=device)
+        empty_mask = torch.empty((0, orig_h, orig_w), dtype=torch.uint8, device=device)
+        empty_any = torch.empty((0,), dtype=torch.int32, device=device)
+        return empty_combined, empty_mask, empty_any
 
     return (
-        xyxy[:n_survivors],
-        conf[:n_survivors],
-        cls_id[:n_survivors],
-        mask_bin_full[:n_survivors],
-        mask_any[:n_survivors],  # int32; caller can .bool() if needed
+        combined[:n_survivors],       # (n, 6) int32
+        mask_bin_full[:n_survivors],  # (n, H, W) uint8
+        mask_any[:n_survivors],       # (n,) int32
     )

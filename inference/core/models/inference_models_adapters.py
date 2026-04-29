@@ -316,13 +316,25 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             H = preproc_metadata.original_size.height
             W = preproc_metadata.original_size.width
 
-            # The triton_rfdetr_fullpost path returns compact tensors (rows =
-            # surviving detections), so there's no padding to filter out.
-            # masks2poly already fast-skips empty masks internally, so we
-            # don't need a GPU-side .any() + masked_select dance.
-            xyxy = det.xyxy.detach().cpu().numpy()
-            confs = det.confidence.detach().cpu().numpy()
-            class_ids = det.class_id.detach().cpu().numpy()
+            # Fast path: triton_rfdetr_fullpost returns padded buffers plus
+            # the atomic counter. One .cpu() for the combined (N, 6) int32
+            # scalar buffer, one .cpu() for the mask buffer, one .item() to
+            # get n_survivors (the counter DtoH doubles as the sync for the
+            # in-flight .cpu() calls because they're on the same stream).
+            # Fast path: single .cpu() of the combined (n, 6) int32 buffer
+            # plus one .cpu() for the mask buffer. Tensors are already
+            # sliced to n_survivors by the Triton wrapper (which did the
+            # counter sync inside the post_process_stream context).
+            combined_gpu = getattr(det, "_combined_gpu", None)
+            if combined_gpu is not None:
+                combined_cpu = combined_gpu.detach().cpu().numpy()
+                xyxy = combined_cpu[:, :4]
+                confs = combined_cpu[:, 4].view(np.float32)
+                class_ids = combined_cpu[:, 5]
+            else:
+                xyxy = det.xyxy.detach().cpu().numpy()
+                confs = det.confidence.detach().cpu().numpy()
+                class_ids = det.class_id.detach().cpu().numpy()
             masks = det.mask.detach().cpu().numpy()
             polys = masks2poly(masks)
 

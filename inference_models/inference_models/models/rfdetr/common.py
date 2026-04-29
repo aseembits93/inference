@@ -104,7 +104,7 @@ def post_process_instance_segmentation_results(
     ):
         meta = pre_processing_meta[0]
         thr_arg = threshold if isinstance(threshold, torch.Tensor) else float(threshold)
-        xyxy, conf, cls_id, mask_bin, mask_any = triton_rfdetr_fullpost(
+        combined, mask_bin, mask_any = triton_rfdetr_fullpost(
             bboxes=bboxes,
             logits=logits,
             masks=masks,
@@ -116,15 +116,15 @@ def post_process_instance_segmentation_results(
             scale_wh=(meta.scale_width, meta.scale_height),
             orig_size_wh=(meta.original_size.width, meta.original_size.height),
         )
-        # Outputs are already compact + rounded + int. Pass mask_bin as uint8
-        # directly — the adapter eventually runs masks2poly on numpy bool/uint8
-        # equivalent and we avoid a GPU-side .to(bool) kernel launch.
+        # `combined` packs [xyxy|conf_i32|cls_id] as (n, 6) int32. Attach as
+        # side-channel so the adapter can do ONE .cpu() instead of three.
         detections = InstanceDetections(
-            xyxy=xyxy,
-            confidence=conf,
-            class_id=cls_id,
+            xyxy=combined[:, :4],
+            confidence=combined[:, 4],  # int32 bits; adapter bitcasts to fp32
+            class_id=combined[:, 5],
             mask=mask_bin,
         )
+        detections.__dict__["_combined_gpu"] = combined
         results.append(detections)
         return results
     use_triton = _TRITON_POSTPROC_READY and bboxes.is_cuda
