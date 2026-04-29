@@ -440,5 +440,5 @@ def triton_rfdetr_fullpost(
         conf[:n_survivors],
         cls_id[:n_survivors],
         mask_bin_full[:n_survivors],
-        mask_any[:n_survivors].bool(),
+        mask_any[:n_survivors],  # int32; caller can .bool() if needed
     )

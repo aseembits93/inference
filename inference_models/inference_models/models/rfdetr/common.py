@@ -116,16 +116,15 @@ def post_process_instance_segmentation_results(
             scale_wh=(meta.scale_width, meta.scale_height),
             orig_size_wh=(meta.original_size.width, meta.original_size.height),
         )
-        # Outputs are already compact + rounded + int. Attach mask_any onto
-        # the detections object so the adapter can skip its own .any() reduction.
+        # Outputs are already compact + rounded + int. Pass mask_bin as uint8
+        # directly — the adapter eventually runs masks2poly on numpy bool/uint8
+        # equivalent and we avoid a GPU-side .to(bool) kernel launch.
         detections = InstanceDetections(
             xyxy=xyxy,
             confidence=conf,
             class_id=cls_id,
-            mask=mask_bin.to(torch.bool),
+            mask=mask_bin,
         )
-        # Side-channel: attach mask_any for the adapter's U7 path.
-        detections.__dict__["mask_any"] = mask_any
         results.append(detections)
         return results
     use_triton = _TRITON_POSTPROC_READY and bboxes.is_cuda
