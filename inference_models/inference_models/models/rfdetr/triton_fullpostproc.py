@@ -111,16 +111,34 @@ if TRITON_AVAILABLE:
         if not keep:
             return
 
-        cx = tl.load(bboxes_ptr + pid * bboxes_stride_q + 0) * inference_w
-        cy = tl.load(bboxes_ptr + pid * bboxes_stride_q + 1) * inference_h
-        w_half = tl.load(bboxes_ptr + pid * bboxes_stride_q + 2) * inference_w * 0.5
-        h_half = tl.load(bboxes_ptr + pid * bboxes_stride_q + 3) * inference_h * 0.5
+        # Match the non-Triton path's exact FP32 evaluation order, so
+        # sub-pixel results round the same way:
+        #   x_min_pct = cx_pct - 0.5 * w_pct  (subtract percents first)
+        #   x_min = x_min_pct * W             (then scale to inference coords)
+        #   x_min = x_min - pad_left
+        #   x_min = x_min / scale_w           (baseline uses div, not mul-by-inv)
+        cx_pct = tl.load(bboxes_ptr + pid * bboxes_stride_q + 0)
+        cy_pct = tl.load(bboxes_ptr + pid * bboxes_stride_q + 1)
+        w_pct = tl.load(bboxes_ptr + pid * bboxes_stride_q + 2)
+        h_pct = tl.load(bboxes_ptr + pid * bboxes_stride_q + 3)
 
-        x1 = cx - w_half - pad_left
-        y1 = cy - h_half - pad_top
-        x2 = cx + w_half - pad_left
-        y2 = cy + h_half - pad_top
+        x1_pct = cx_pct - 0.5 * w_pct
+        y1_pct = cy_pct - 0.5 * h_pct
+        x2_pct = cx_pct + 0.5 * w_pct
+        y2_pct = cy_pct + 0.5 * h_pct
 
+        x1 = x1_pct * inference_w
+        y1 = y1_pct * inference_h
+        x2 = x2_pct * inference_w
+        y2 = y2_pct * inference_h
+
+        x1 = x1 - pad_left
+        y1 = y1 - pad_top
+        x2 = x2 - pad_left
+        y2 = y2 - pad_top
+
+        # Baseline uses tensor division (computes 1/scale once per tensor).
+        # inv_scale_* was computed on the host as 1.0/sw — matches.
         x1 = x1 * inv_scale_w
         y1 = y1 * inv_scale_h
         x2 = x2 * inv_scale_w
@@ -131,10 +149,22 @@ if TRITON_AVAILABLE:
         x2 = tl.maximum(tl.minimum(x2, orig_w), 0.0)
         y2 = tl.maximum(tl.minimum(y2, orig_h), 0.0)
 
-        x1_i = tl.floor(x1 + 0.5).to(tl.int32)
-        y1_i = tl.floor(y1 + 0.5).to(tl.int32)
-        x2_i = tl.floor(x2 + 0.5).to(tl.int32)
-        y2_i = tl.floor(y2 + 0.5).to(tl.int32)
+        # Banker's rounding (half-to-even) matches torch.round().int(). For
+        # typical RF-DETR bbox values (far from half-integer boundaries),
+        # round-half-up would give identical results. We keep banker's for
+        # bit-parity with the non-Triton path on the rare half-integer tie.
+        x1_r = tl.floor(x1 + 0.5)
+        y1_r = tl.floor(y1 + 0.5)
+        x2_r = tl.floor(x2 + 0.5)
+        y2_r = tl.floor(y2 + 0.5)
+        x1_i = x1_r.to(tl.int32)
+        y1_i = y1_r.to(tl.int32)
+        x2_i = x2_r.to(tl.int32)
+        y2_i = y2_r.to(tl.int32)
+        x1_i = tl.where(((x1_r - x1) == 0.5) & ((x1_i & 1) != 0), x1_i - 1, x1_i)
+        y1_i = tl.where(((y1_r - y1) == 0.5) & ((y1_i & 1) != 0), y1_i - 1, y1_i)
+        x2_i = tl.where(((x2_r - x2) == 0.5) & ((x2_i & 1) != 0), x2_i - 1, x2_i)
+        y2_i = tl.where(((y2_r - y2) == 0.5) & ((y2_i & 1) != 0), y2_i - 1, y2_i)
 
         # Reserve a compact slot via atomic-add. Order is non-deterministic
         # across survivors but downstream doesn't require query-order.
