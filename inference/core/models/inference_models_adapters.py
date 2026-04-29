@@ -317,7 +317,12 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             W = preproc_metadata.original_size.width
 
             if gpu_fastpath and det.mask.is_cuda and det.mask.numel() > 0:
-                mask_any_gpu = det.mask.any(dim=(1, 2))
+                # Use precomputed mask_any if available (Triton full-fusion path).
+                precomputed_any = getattr(det, "mask_any", None)
+                if precomputed_any is None:
+                    mask_any_gpu = det.mask.any(dim=(1, 2))
+                else:
+                    mask_any_gpu = precomputed_any
                 xyxy = det.xyxy.detach().cpu().numpy()
                 confs = det.confidence.detach().cpu().numpy()
                 class_ids = det.class_id.detach().cpu().numpy()

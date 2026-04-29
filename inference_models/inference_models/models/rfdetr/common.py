@@ -104,7 +104,7 @@ def post_process_instance_segmentation_results(
     ):
         meta = pre_processing_meta[0]
         thr_arg = threshold if isinstance(threshold, torch.Tensor) else float(threshold)
-        xyxy, conf, cls_id, keep, mask_bin = triton_rfdetr_fullpost(
+        xyxy, conf, cls_id, mask_bin, mask_any = triton_rfdetr_fullpost(
             bboxes=bboxes,
             logits=logits,
             masks=masks,
@@ -116,12 +116,16 @@ def post_process_instance_segmentation_results(
             scale_wh=(meta.scale_width, meta.scale_height),
             orig_size_wh=(meta.original_size.width, meta.original_size.height),
         )
+        # Outputs are already compact + rounded + int. Attach mask_any onto
+        # the detections object so the adapter can skip its own .any() reduction.
         detections = InstanceDetections(
-            xyxy=xyxy[keep].round().int(),
-            confidence=conf[keep],
-            class_id=cls_id[keep],
-            mask=mask_bin[keep].bool(),
+            xyxy=xyxy,
+            confidence=conf,
+            class_id=cls_id,
+            mask=mask_bin.to(torch.bool),
         )
+        # Side-channel: attach mask_any for the adapter's U7 path.
+        detections.__dict__["mask_any"] = mask_any
         results.append(detections)
         return results
     use_triton = _TRITON_POSTPROC_READY and bboxes.is_cuda
