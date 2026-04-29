@@ -159,6 +159,7 @@ if TRITON_AVAILABLE:
     def _rfdetr_fullpost_mask_kernel_compact(
         masks_ptr,           # (num_queries, mask_h, mask_w) fp32
         survivor_idx_ptr,    # (n_survivors,) int32 — indices into num_queries
+        counter_ptr,         # (1,) int32 — n_survivors; used for GPU-side early exit
         out_ptr,             # (n_survivors, orig_h, orig_w) uint8 — compact binary mask
         mask_any_ptr,        # (n_survivors,) int32 — 1 if any pixel survives threshold, 0 else
         mask_h,
@@ -176,9 +177,15 @@ if TRITON_AVAILABLE:
         BLOCK_H: tl.constexpr,
         BLOCK_W: tl.constexpr,
     ):
-        s = tl.program_id(0)  # survivor index in [0, n_survivors)
+        s = tl.program_id(0)  # survivor index in [0, num_queries) — over-launched
         tile_y = tl.program_id(1)
         tile_x = tl.program_id(2)
+
+        # GPU-side early exit: filter kernel atomic-added into counter; any
+        # program with s >= counter has no corresponding survivor.
+        n_survivors = tl.load(counter_ptr)
+        if s >= n_survivors:
+            return
 
         # Look up the source query slot for the bilinear gather.
         q = tl.load(survivor_idx_ptr + s)
@@ -243,30 +250,27 @@ def _next_pow2(n: int) -> int:
 # Cache small supporting tensors so we don't incur HtoD for them per frame.
 _THRESHOLD_CACHE: dict = {}
 _EMPTY_INT32 = torch.empty((1,), dtype=torch.int32)
-_MASK_ANY_BUFFER_CACHE: dict = {}
+_MASK_BIN_BUFFER_CACHE: dict = {}
 
 
-def _get_mask_any_buffer(capacity: int, device: torch.device) -> torch.Tensor:
-    """Return a pre-zeroed reusable int32 buffer for mask_any. Avoids a
-    torch.zeros kernel launch per frame. Caller must not assume other
-    frames haven't written to unused indices — caller slices [:n_survivors]
-    and only reads values we wrote.
+def _get_mask_bin_buffer(
+    capacity: int, orig_h: int, orig_w: int, device: torch.device
+) -> torch.Tensor:
+    """Return a reusable (capacity, orig_h, orig_w) uint8 mask buffer.
 
-    We clear (zero_) the slice we hand out using a kernel launch the first
-    time we see a capacity, then on subsequent calls just return the same
-    buffer after a cheap view — no zero_() needed because the mask kernel's
-    atomic_max starts from whatever's there.
-
-    Correctness hinges on: atomic_max(x, 0) is a no-op. So if the previous
-    frame left this slot at 1, the atomic_max(..., tile_any) can't lower it
-    to 0. We must zero before use. Implementation: keep zero_() but only
-    on the slice we use, not the whole buffer.
+    Avoids a per-frame torch.empty kernel for the biggest allocation in the
+    post-process path (capacity * H * W bytes — ~10 MB at 100*240*426).
+    We return the full buffer; the caller views [:n_survivors]. Rows beyond
+    n_survivors may contain stale data from prior frames; the caller must
+    only read the slice it sizes via the atomic counter.
     """
-    key = (capacity, device)
-    buf = _MASK_ANY_BUFFER_CACHE.get(key)
+    key = (capacity, orig_h, orig_w, device)
+    buf = _MASK_BIN_BUFFER_CACHE.get(key)
     if buf is None:
-        buf = torch.zeros(capacity, dtype=torch.int32, device=device)
-        _MASK_ANY_BUFFER_CACHE[key] = buf
+        buf = torch.empty(
+            (capacity, orig_h, orig_w), dtype=torch.uint8, device=device
+        )
+        _MASK_BIN_BUFFER_CACHE[key] = buf
     return buf
 
 
@@ -384,8 +388,42 @@ def triton_rfdetr_fullpost(
         BLOCK_C=BLOCK_C,
     )
 
-    # Single DtoH: read the atomic counter. This is the only sync in the
-    # post-process path.
+    # Launch the mask kernel with max grid (num_queries). Each program
+    # checks counter[0] on GPU and early-exits if its s index is out of
+    # range. This lets us skip a CPU-blocking counter.item() between the
+    # two kernel launches — both get queued to the stream immediately.
+    mask_bin_full = _get_mask_bin_buffer(num_queries, orig_h, orig_w, device)
+
+    BLOCK_H = 16
+    BLOCK_W = 16
+    grid = (
+        num_queries,
+        (orig_h + BLOCK_H - 1) // BLOCK_H,
+        (orig_w + BLOCK_W - 1) // BLOCK_W,
+    )
+    _rfdetr_fullpost_mask_kernel_compact[grid](
+        masks_3d,
+        survivor_idx,
+        counter,
+        mask_bin_full,
+        mask_any,
+        int(mask_h),
+        int(mask_w),
+        int(orig_h),
+        int(orig_w),
+        float(mask_h / orig_h),
+        float(mask_w / orig_w),
+        masks_3d.stride(0),
+        masks_3d.stride(1),
+        mask_bin_full.stride(0),
+        mask_bin_full.stride(1),
+        BLOCK_H=BLOCK_H,
+        BLOCK_W=BLOCK_W,
+    )
+
+    # Now read the counter. The sync happens after mask-kernel launch, not
+    # between it and the filter, so the two kernels pipeline on the GPU
+    # while the host waits.
     n_survivors = int(counter.item())
 
     if n_survivors == 0:
@@ -397,43 +435,10 @@ def triton_rfdetr_fullpost(
             torch.empty((0,), dtype=torch.bool, device=device),
         )
 
-    # Views into the first n_survivors slots (no copy).
-    xyxy_compact = xyxy[:n_survivors]
-    conf_compact = conf[:n_survivors]
-    cls_compact = cls_id[:n_survivors]
-    survivor_idx_view = survivor_idx[:n_survivors]
-
-    mask_bin = torch.empty(
-        (n_survivors, orig_h, orig_w), dtype=torch.uint8, device=device
+    return (
+        xyxy[:n_survivors],
+        conf[:n_survivors],
+        cls_id[:n_survivors],
+        mask_bin_full[:n_survivors],
+        mask_any[:n_survivors].bool(),
     )
-    # mask_any was zero-initialized inside the filter kernel for each
-    # compact slot; just take the view for the mask kernel to atomic_max into.
-    mask_any_view = mask_any[:n_survivors]
-
-    BLOCK_H = 16
-    BLOCK_W = 16
-    grid = (
-        n_survivors,
-        (orig_h + BLOCK_H - 1) // BLOCK_H,
-        (orig_w + BLOCK_W - 1) // BLOCK_W,
-    )
-    _rfdetr_fullpost_mask_kernel_compact[grid](
-        masks_3d,
-        survivor_idx_view,
-        mask_bin,
-        mask_any_view,
-        int(mask_h),
-        int(mask_w),
-        int(orig_h),
-        int(orig_w),
-        float(mask_h / orig_h),
-        float(mask_w / orig_w),
-        masks_3d.stride(0),
-        masks_3d.stride(1),
-        mask_bin.stride(0),
-        mask_bin.stride(1),
-        BLOCK_H=BLOCK_H,
-        BLOCK_W=BLOCK_W,
-    )
-
-    return xyxy_compact, conf_compact, cls_compact, mask_bin, mask_any_view.bool()
