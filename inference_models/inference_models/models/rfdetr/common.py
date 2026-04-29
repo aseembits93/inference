@@ -1,9 +1,28 @@
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
 from torchvision.transforms import functional
 
 from inference_models import InstanceDetections
+
+_RFDETR_TRITON_POSTPROC = os.getenv("RFDETR_TRITON_POSTPROC", "false").lower() in (
+    "true",
+    "1",
+)
+if _RFDETR_TRITON_POSTPROC:
+    try:
+        from inference_models.models.rfdetr.triton_postprocess import (
+            TRITON_AVAILABLE as _TRITON_POSTPROC_AVAILABLE,
+            triton_rfdetr_conf_filter,
+        )
+        _TRITON_POSTPROC_READY = _TRITON_POSTPROC_AVAILABLE and torch.cuda.is_available()
+    except Exception:
+        _TRITON_POSTPROC_READY = False
+        triton_rfdetr_conf_filter = None
+else:
+    _TRITON_POSTPROC_READY = False
+    triton_rfdetr_conf_filter = None
 from inference_models.entities import ImageDimensions
 from inference_models.errors import CorruptedModelPackageError
 from inference_models.models.common.roboflow.model_packages import (
@@ -51,35 +70,51 @@ def post_process_instance_segmentation_results(
     num_classes: int,
     classes_re_mapping: Optional[ClassesReMapping],
 ) -> List[InstanceDetections]:
-    logits_sigmoid = torch.nn.functional.sigmoid(logits)
     results = []
     device = bboxes.device
+    use_triton = _TRITON_POSTPROC_READY and bboxes.is_cuda
     if isinstance(threshold, torch.Tensor):
-        threshold = threshold.to(device=device, dtype=logits_sigmoid.dtype)
-    for image_bboxes, image_logits, image_masks, image_meta in zip(
-        bboxes, logits_sigmoid, masks, pre_processing_meta
-    ):
-        confidence, top_classes = image_logits.max(dim=1)
-        if classes_re_mapping is not None:
-            remapping_mask = torch.isin(
-                top_classes, classes_re_mapping.remaining_class_ids
+        threshold_dtype = logits.dtype if use_triton else torch.float32
+        threshold = threshold.to(device=device, dtype=threshold_dtype)
+    if use_triton:
+        iterator = zip(bboxes, logits, masks, pre_processing_meta)
+    else:
+        logits_sigmoid = torch.nn.functional.sigmoid(logits)
+        if isinstance(threshold, torch.Tensor):
+            threshold = threshold.to(device=device, dtype=logits_sigmoid.dtype)
+        iterator = zip(bboxes, logits_sigmoid, masks, pre_processing_meta)
+    cmap = classes_re_mapping.class_mapping if classes_re_mapping is not None else None
+    for image_bboxes, image_logits, image_masks, image_meta in iterator:
+        if use_triton:
+            confidence, top_classes, keep = triton_rfdetr_conf_filter(
+                image_logits, threshold, num_classes, class_mapping=cmap
             )
-            top_classes = classes_re_mapping.class_mapping[top_classes[remapping_mask]]
-            confidence = confidence[remapping_mask]
-            image_bboxes = image_bboxes[remapping_mask]
-            image_masks = image_masks[remapping_mask]
+            confidence = confidence[keep]
+            top_classes = top_classes[keep].long()
+            selected_boxes = image_bboxes[keep]
+            selected_masks = image_masks[keep]
         else:
-            # drop DETR no-object rows
-            named = top_classes < num_classes
-            confidence = confidence[named]
-            top_classes = top_classes[named]
-            image_bboxes = image_bboxes[named]
-            image_masks = image_masks[named]
-        confidence_mask = confidence > (threshold[top_classes.long()] if isinstance(threshold, torch.Tensor) else threshold)
-        confidence = confidence[confidence_mask]
-        top_classes = top_classes[confidence_mask]
-        selected_boxes = image_bboxes[confidence_mask]
-        selected_masks = image_masks[confidence_mask]
+            confidence, top_classes = image_logits.max(dim=1)
+            if classes_re_mapping is not None:
+                remapping_mask = torch.isin(
+                    top_classes, classes_re_mapping.remaining_class_ids
+                )
+                top_classes = classes_re_mapping.class_mapping[top_classes[remapping_mask]]
+                confidence = confidence[remapping_mask]
+                image_bboxes = image_bboxes[remapping_mask]
+                image_masks = image_masks[remapping_mask]
+            else:
+                # drop DETR no-object rows
+                named = top_classes < num_classes
+                confidence = confidence[named]
+                top_classes = top_classes[named]
+                image_bboxes = image_bboxes[named]
+                image_masks = image_masks[named]
+            confidence_mask = confidence > (threshold[top_classes.long()] if isinstance(threshold, torch.Tensor) else threshold)
+            confidence = confidence[confidence_mask]
+            top_classes = top_classes[confidence_mask]
+            selected_boxes = image_bboxes[confidence_mask]
+            selected_masks = image_masks[confidence_mask]
         confidence, sorted_indices = torch.sort(confidence, descending=True)
         top_classes = top_classes[sorted_indices]
         selected_boxes = selected_boxes[sorted_indices]

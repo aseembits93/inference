@@ -47,12 +47,36 @@ from inference.core.utils.onnx import (
     run_session_via_iobinding,
 )
 from inference.core.utils.postprocess import mask2poly
+from inference.core.utils.environment import str2bool
 from inference.core.utils.preprocess import letterbox_image
 
 if USE_PYTORCH_FOR_PREPROCESSING:
     import torch
 
     CUDA_IS_AVAILABLE = torch.cuda.is_available()
+
+RFDETR_USE_TRITON_PREPROC = str2bool(os.getenv("RFDETR_USE_TRITON_PREPROC", False))
+
+if RFDETR_USE_TRITON_PREPROC:
+    try:
+        import torch
+
+        from inference.models.rfdetr.triton_preprocess import (
+            TRITON_AVAILABLE,
+            triton_preprocess_rfdetr,
+        )
+
+        _TRITON_PREPROC_READY = TRITON_AVAILABLE and torch.cuda.is_available()
+    except Exception as _triton_err:  # pragma: no cover
+        logger.warning(
+            "RFDETR_USE_TRITON_PREPROC=1 but triton preprocess unavailable: %s",
+            _triton_err,
+        )
+        _TRITON_PREPROC_READY = False
+        triton_preprocess_rfdetr = None
+else:
+    _TRITON_PREPROC_READY = False
+    triton_preprocess_rfdetr = None
 
 ROBOFLOW_BACKGROUND_CLASS = "background_class83422"
 
@@ -73,6 +97,25 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
     preprocess_means = [0.485, 0.456, 0.406]
     preprocess_stds = [0.229, 0.224, 0.225]
 
+    _preproc_cache_initialized: bool = False
+
+    def _ensure_preproc_cache(self, device) -> None:
+        if self._preproc_cache_initialized:
+            return
+        means = torch.tensor(self.preprocess_means, device=device, dtype=torch.float32)
+        stds = torch.tensor(self.preprocess_stds, device=device, dtype=torch.float32)
+        self._preproc_scale_gpu = (1.0 / (255.0 * stds)).view(1, 3, 1, 1).contiguous()
+        self._preproc_offset_gpu = (-means / stds).view(1, 3, 1, 1).contiguous()
+        self._input_buffer = torch.empty(
+            (1, 3, self.img_size_h, self.img_size_w),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._preproc_bgr2rgb_idx = torch.tensor(
+            [2, 1, 0], device=device, dtype=torch.long
+        )
+        self._preproc_cache_initialized = True
+
     @property
     def weights_file(self) -> str:
         """Gets the weights file for the RFDETR model.
@@ -81,6 +124,38 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
             str: Path to the ONNX weights file.
         """
         return "weights.onnx"
+
+    def _try_triton_preprocess(
+        self, image: Any
+    ) -> Optional[Tuple["torch.Tensor", Tuple[int, int]]]:
+        if isinstance(image, np.ndarray):
+            src = image
+        elif isinstance(image, InferenceRequestImage):
+            try:
+                src, _ = load_image(image, disable_preproc_auto_orient=True)
+            except Exception:
+                return None
+            if not isinstance(src, np.ndarray):
+                return None
+        else:
+            return None
+
+        if src.dtype != np.uint8 or src.ndim != 3 or src.shape[2] != 3:
+            return None
+        if self._needs_nonsquare_preproc:
+            return None
+
+        orig_h, orig_w = src.shape[0], src.shape[1]
+        src_gpu = torch.from_numpy(np.ascontiguousarray(src)).cuda(non_blocking=True)
+        out = triton_preprocess_rfdetr(
+            src_gpu,
+            target_h=self.img_size_h,
+            target_w=self.img_size_w,
+            means=tuple(self.preprocess_means),
+            stds=tuple(self.preprocess_stds),
+            pad_color=114,
+        )
+        return out, (orig_h, orig_w)
 
     def preproc_image(
         self,
@@ -103,6 +178,15 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         Returns:
             Tuple[np.ndarray, Tuple[int, int]]: A tuple containing a numpy array of the preprocessed image pixel data and a tuple of the images original size.
         """
+        if (
+            _TRITON_PREPROC_READY
+            and USE_PYTORCH_FOR_PREPROCESSING
+            and self.resize_method in ("Fit (grey edges) in", "Stretch to")
+        ):
+            triton_out = self._try_triton_preprocess(image)
+            if triton_out is not None:
+                return triton_out
+
         if isinstance(image, Image.Image) and USE_PYTORCH_FOR_PREPROCESSING:
             if CUDA_IS_AVAILABLE:
                 np_image = torch.from_numpy(np.asarray(image, copy=False)).cuda()
@@ -135,15 +219,12 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
             )
             preprocessed_image = preprocessed_image.float()
 
-            preprocessed_image /= 255.0
-
-            means = torch.tensor(
-                self.preprocess_means, device=preprocessed_image.device
-            ).view(3, 1, 1)
-            stds = torch.tensor(
-                self.preprocess_stds, device=preprocessed_image.device
-            ).view(3, 1, 1)
-            preprocessed_image = (preprocessed_image - means) / stds
+            self._ensure_preproc_cache(preprocessed_image.device)
+            preprocessed_image = torch.addcmul(
+                self._preproc_offset_gpu,
+                preprocessed_image,
+                self._preproc_scale_gpu,
+            )
         else:
             preprocessed_image = preprocessed_image.astype(np.float32)
             preprocessed_image /= 255.0
@@ -224,14 +305,22 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
             if isinstance(resized, np.ndarray):
                 resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             else:
-                resized = resized[:, [2, 1, 0], :, :]
+                resized = resized.index_select(1, self._preproc_bgr2rgb_idx)
 
         if isinstance(resized, np.ndarray):
             img_in = np.transpose(resized, (2, 0, 1))
             img_in = img_in.astype(np.float32)
             img_in = np.expand_dims(img_in, axis=0)
         elif USE_PYTORCH_FOR_PREPROCESSING:
-            img_in = resized.float()
+            if (
+                not self.batching_enabled
+                and self._preproc_cache_initialized
+                and resized.shape == self._input_buffer.shape
+            ):
+                self._input_buffer.copy_(resized, non_blocking=True)
+                img_in = self._input_buffer
+            else:
+                img_in = resized
         else:
             raise ValueError(
                 f"Received an image of unknown type, {type(resized)}; "
