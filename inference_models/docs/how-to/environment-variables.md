@@ -431,6 +431,44 @@ Default: Inherits from `INFERENCE_MODELS_DEFAULT_CONFIDENCE`
 export INFERENCE_MODELS_RFDETR_DEFAULT_CONFIDENCE="0.5"
 ```
 
+##### RF-DETR performance flags (Triton)
+
+Opt-in fused CUDA kernels for the RF-DETR hot path. Each flag is independent,
+defaults to off, and requires both `triton` and a CUDA device at import time;
+if either is missing the flag is silently ignored and the torch path runs.
+
+**`RFDETR_USE_TRITON_PREPROC`**
+Fused preprocess kernel (resize + BGR→RGB + ImageNet normalize in one launch).
+Covers the letterbox variant for the ONNX path in
+`inference/models/rfdetr/triton_preprocess.py` and the `STRETCH_TO` variant
+for the TRT path in `inference_models/models/rfdetr/triton_preprocess.py`.
+Default: `false`.
+
+```bash
+export RFDETR_USE_TRITON_PREPROC="true"
+```
+
+**`RFDETR_TRITON_POSTPROC`**
+Fused sigmoid + argmax + class-remap + confidence-threshold kernel for the
+first stage of post-processing. Remaining ops (sort, gather, bbox denorm,
+mask alignment) stay in torch. Default: `false`.
+
+```bash
+export RFDETR_TRITON_POSTPROC="true"
+```
+
+**`RFDETR_TRITON_FULLPOSTPROC`** (experimental)
+Fuses the entire post-TRT chain — filter, bbox denorm/clip/round, GPU mask
+upsample + threshold — into two Triton kernels. Output *contents* are
+deterministic; survivor *order* is not (atomic-add compaction). Requires
+`batch=1`, `STRETCH_TO`-equivalent resize, no static crop, and class
+remapping; falls back to `RFDETR_TRITON_POSTPROC` / torch otherwise.
+Default: `false`.
+
+```bash
+export RFDETR_TRITON_FULLPOSTPROC="true"
+```
+
 #### Roboflow Instant
 
 **`INFERENCE_MODELS_ROBOFLOW_INSTANT_DEFAULT_CONFIDENCE`**

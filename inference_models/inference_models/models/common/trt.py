@@ -1,3 +1,35 @@
+"""TensorRT runtime wrappers + CUDA-graph capture/replay.
+
+TRT producer/consumer side-channel contract
+-------------------------------------------
+To let downstream code overlap post-processing with the next forward without
+plumbing new return types through the whole stack, the CUDA-graph replay path
+attaches three markers via attribute assignment. Consumers use ``getattr(...,
+default)`` so the markers are invisible to non-fast-path callers.
+
+``_trt_reuse_as_input_buffer``  (set by caller on the input tensor)
+    If ``True`` on the ``pre_processed_images`` tensor passed into
+    ``infer_from_trt_engine``, graph capture will bake that tensor's address
+    directly into the graph and replay will skip the per-frame DtoD copy into
+    the graph's internal input buffer. The caller must (a) keep the same
+    ``torch.Tensor`` object alive for the lifetime of the graph and (b) write
+    its contents in-place before every replay.
+    Read in: ``_capture_cuda_graph`` and the replay branch of
+    ``_execute_trt_engine``.
+
+``_trt_produce_event``  (attached to ``results[0]`` in ``infer_from_trt_engine``)
+    ``torch.cuda.Event`` recorded on the stream that actually produced the
+    outputs (the graph's own capture stream when a graph was used, otherwise
+    the caller's ``stream``). Consumers on other streams should
+    ``event.wait(consumer_stream)`` before reading the outputs rather than
+    CPU-syncing.
+
+``_trt_graph_state``  (attached to ``results[0]`` on the replay path only)
+    The ``TRTCudaGraphState`` that owns the returned output buffers. Consumers
+    that read those buffers directly (no clone) must record a
+    ``torch.cuda.Event`` into ``graph_state.consumer_done_event`` on their own
+    stream; the next graph replay waits on it before overwriting the outputs.
+"""
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -575,9 +607,10 @@ def infer_from_trt_engine(
             outputs=outputs,
             trt_cuda_graph_cache=trt_cuda_graph_cache,
         )
-    # Graph-replay path: record the event on the graph's own stream so
-    # downstream can wait on the correct stream (the graph captures on a
-    # dedicated stream, not `stream`). Non-graph path: record on `stream`.
+    # Contract: see module docstring (``_trt_graph_state``, ``_trt_produce_event``).
+    # Record the event on the stream that actually produced the outputs — the
+    # graph's own capture stream on the replay path, the caller's stream
+    # otherwise — so cross-stream consumers wait on the right dependency.
     if hasattr(results[0], "_trt_graph_state"):
         graph_state = results[0]._trt_graph_state
         produce_event = torch.cuda.Event()
@@ -706,10 +739,7 @@ def _execute_trt_engine(
         if cache_key not in trt_cuda_graph_cache:
             LOGGER.debug("Capturing CUDA graph for shape %s", input_shape)
 
-            # If the caller hands us a stable pre-allocated buffer and
-            # promises to keep writing in-place to it, we can bake its
-            # address directly into the graph and skip the per-frame DtoD
-            # copy. Marker attribute set by the model's pre_process path.
+            # Contract: see module docstring (``_trt_reuse_as_input_buffer``).
             use_external = getattr(
                 pre_processed_images, "_trt_reuse_as_input_buffer", False
             )
@@ -727,22 +757,22 @@ def _execute_trt_engine(
         else:
             trt_cuda_graph_state = trt_cuda_graph_cache[cache_key]
             stream = trt_cuda_graph_state.cuda_stream
-            # Before re-running the graph, make sure any consumer of the
-            # previous frame's outputs is done. Post-process callers that read
-            # the output buffers directly must record into consumer_done_event.
+            # Wait for the previous frame's consumer before overwriting the
+            # output buffers. Contract: see module docstring
+            # (``_trt_graph_state`` / ``consumer_done_event``).
             consumer_done = trt_cuda_graph_state.consumer_done_event
             if consumer_done is not None:
                 consumer_done.wait(stream)
             with torch.cuda.stream(stream):
-                # Skip the DtoD copy if the caller is writing in-place to
-                # the graph's own input buffer (input_buffer is the same
-                # torch.Tensor object as pre_processed_images).
+                # Skip the DtoD copy when the caller is writing in-place to
+                # the graph's own input buffer — see module docstring
+                # (``_trt_reuse_as_input_buffer``).
                 if trt_cuda_graph_state.input_buffer.data_ptr() != pre_processed_images.data_ptr():
                     trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
                 trt_cuda_graph_state.cuda_graph.replay()
-            # Return graph-owned output buffers directly — no clone. Attach
-            # the graph state as a side-channel so consumers can record into
-            # consumer_done_event without plumbing the cache through.
+            # Return graph-owned output buffers directly (no clone) and
+            # attach the graph state as a side-channel. Contract: see module
+            # docstring (``_trt_graph_state``).
             results = list(trt_cuda_graph_state.output_buffers)
             results[0]._trt_graph_state = trt_cuda_graph_state
             return results

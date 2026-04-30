@@ -1,3 +1,18 @@
+"""RF-DETR instance segmentation on TensorRT.
+
+Opt-in perf paths
+-----------------
+``RFDETR_USE_TRITON_PREPROC=1`` routes the common hot path (numpy HWC BGR
+uint8 frame, ``STRETCH_TO`` resize, no static crop/contrast/grayscale,
+single-image batch) through a fused Triton kernel, writing directly into a
+reusable input buffer that the TRT CUDA graph consumes in-place.
+
+See ``inference_models/docs/how-to/environment-variables.md#rf-detr`` for
+the full flag table and
+``inference_models/models/common/trt.py`` for the graph-side markers
+(``_trt_reuse_as_input_buffer`` / ``_trt_produce_event`` / ``_trt_graph_state``)
+used to drive the zero-copy replay path.
+"""
 import os
 import threading
 from typing import List, Optional, Tuple, Union
@@ -26,6 +41,7 @@ from inference_models.models.common.cuda import (
 )
 from inference_models.models.common.model_packages import get_model_package_contents
 from inference_models.models.common.roboflow.model_packages import (
+    ColorMode,
     InferenceConfig,
     PreProcessingMetadata,
     ResizeMode,
@@ -241,6 +257,63 @@ class RFDetrForInstanceSegmentationTRT(
         self._thread_local_storage = threading.local()
         self.recommended_parameters = recommended_parameters
 
+        # Triton fast-path state. Initialized eagerly because the target shape
+        # and normalization constants are known from ``inference_config``; only
+        # the source-frame pinned buffer stays lazy (shape depends on the
+        # frame). ``_fast_input_buffer`` is ``None`` when the fast path is
+        # structurally disabled (Triton unavailable, non-stretch resize, etc.);
+        # ``_try_fast_preprocess`` short-circuits in that case.
+        self._fast_input_buffer: Optional[torch.Tensor] = None
+        self._fast_means: Optional[Tuple[float, float, float]] = None
+        self._fast_stds: Optional[Tuple[float, float, float]] = None
+        self._fast_src_host_pinned: Optional[torch.Tensor] = None
+        self._fast_src_gpu: Optional[torch.Tensor] = None
+        self._fast_preproc_event: Optional[torch.cuda.Event] = None
+        if _TRITON_READY and self._fast_path_structurally_eligible():
+            ni = self._inference_config.network_input
+            target_h = ni.training_input_size.height
+            target_w = ni.training_input_size.width
+            self._fast_input_buffer = torch.empty(
+                (1, 3, target_h, target_w),
+                dtype=torch.float32,
+                device=self._device,
+            )
+            # Contract: see inference_models/models/common/trt.py module
+            # docstring (``_trt_reuse_as_input_buffer``). Our preproc always
+            # writes in-place into this tensor, so TRT can skip the per-frame
+            # DtoD copy into its internal input buffer.
+            self._fast_input_buffer._trt_reuse_as_input_buffer = True
+            means, stds = ni.normalization
+            self._fast_means = tuple(means)
+            self._fast_stds = tuple(stds)
+
+    def _fast_path_structurally_eligible(self) -> bool:
+        """Return True iff inference_config is compatible with the Triton
+        preproc fast path. Per-call checks (caller color mode, image dtype,
+        batch size) still happen in ``_try_fast_preprocess``."""
+        ipp = self._inference_config.image_pre_processing
+        if (
+            (ipp.static_crop is not None and ipp.static_crop.enabled)
+            or (ipp.contrast is not None and ipp.contrast.enabled)
+            or (ipp.grayscale is not None and ipp.grayscale.enabled)
+        ):
+            return False
+        ni = self._inference_config.network_input
+        if ni.resize_mode != ResizeMode.STRETCH_TO:
+            return False
+        if ni.input_channels != 3:
+            return False
+        if ni.dataset_version_resize_dimensions is not None:
+            return False
+        if ni.scaling_factor not in (None, 255):
+            return False
+        if ni.normalization is None:
+            return False
+        # The model must consume RGB; the kernel does BGR->RGB during gather.
+        if ni.color_mode != ColorMode.RGB:
+            return False
+        return True
+
     @property
     def class_names(self) -> List[str]:
         return self._class_names
@@ -274,40 +347,20 @@ class RFDetrForInstanceSegmentationTRT(
         self._pre_process_stream.synchronize()
         return pre_processed_images, pre_processing_meta
 
-    def _try_fast_preprocess(
+    def _fast_preproc_eligible(
         self,
         images,
-        input_color_format,
-        image_size,
-        pre_processing_overrides,
-    ):
-        if not _TRITON_READY:
-            return None
+        input_color_format: Optional[ColorFormat],
+        image_size: Optional[Tuple[int, int]],
+    ) -> Optional[np.ndarray]:
+        """Return the numpy BGR uint8 frame if the Triton fast path can handle
+        this call, else ``None``. Callers always fall back to the reference
+        path when this returns ``None``."""
+        if self._fast_input_buffer is None:
+            return None  # structurally disabled in __init__
         if image_size is not None:
             return None
-        ipp = self._inference_config.image_pre_processing
-        if (
-            ipp.static_crop is not None
-            and ipp.static_crop.enabled
-            or ipp.contrast is not None
-            and ipp.contrast.enabled
-            or ipp.grayscale is not None
-            and ipp.grayscale.enabled
-        ):
-            return None
-        ni = self._inference_config.network_input
-        if ni.resize_mode != ResizeMode.STRETCH_TO:
-            return None
-        if ni.input_channels != 3:
-            return None
-        if ni.dataset_version_resize_dimensions is not None:
-            return None
-        if ni.scaling_factor not in (None, 255):
-            return None
-        if ni.normalization is None:
-            return None
-        means, stds = ni.normalization
-        # Only handle numpy HWC BGR uint8 (the common hot path).
+        # Only the common hot path: a single numpy HWC BGR uint8 frame.
         if isinstance(images, list):
             if len(images) != 1:
                 return None
@@ -322,42 +375,35 @@ class RFDetrForInstanceSegmentationTRT(
             or candidate.shape[2] != 3
         ):
             return None
-        images = candidate
-        # Color: if caller says RGB, skip; we do BGR->model_color_mode.
-        from inference_models.models.common.roboflow.model_packages import ColorMode
-        caller_mode = ColorMode(input_color_format) if input_color_format is not None else ColorMode.BGR
-        if caller_mode != ColorMode.BGR or ni.color_mode != ColorMode.RGB:
+        caller_mode = (
+            ColorMode(input_color_format) if input_color_format is not None else ColorMode.BGR
+        )
+        if caller_mode != ColorMode.BGR:
+            return None
+        return candidate
+
+    def _try_fast_preprocess(
+        self,
+        images,
+        input_color_format,
+        image_size,
+        pre_processing_overrides,
+    ):
+        frame = self._fast_preproc_eligible(images, input_color_format, image_size)
+        if frame is None:
             return None
 
+        ni = self._inference_config.network_input
         target_h = ni.training_input_size.height
         target_w = ni.training_input_size.width
-        orig_h, orig_w = images.shape[0], images.shape[1]
+        orig_h, orig_w = frame.shape[0], frame.shape[1]
 
-        if not getattr(self, "_fast_buffer_initialized", False):
-            self._fast_input_buffer = torch.empty(
-                (1, 3, target_h, target_w),
-                dtype=torch.float32,
-                device=self._device,
-            )
-            # Marker: tells the TRT CUDA-graph capture path to use this
-            # tensor as the graph's own input buffer, eliminating the
-            # per-frame DtoD copy from our preproc output into the graph's
-            # internal buffer. Our preproc always writes in-place here.
-            self._fast_input_buffer._trt_reuse_as_input_buffer = True
-            self._fast_means = tuple(means)
-            self._fast_stds = tuple(stds)
-            # Pinned host buffer for the raw BGR frame — lets us do a
-            # truly async HtoD into src_gpu. Grown lazily below if the
-            # frame size changes.
-            self._fast_src_host_pinned = None
-            self._fast_src_gpu = None
-            self._fast_buffer_initialized = True
-
-        # Reuse a pinned host staging buffer so torch.Tensor.copy_ with
-        # non_blocking=True actually runs async. Without pinning,
-        # non_blocking is silently promoted to a sync copy.
-        src_shape = images.shape
-        src_nbytes = images.nbytes
+        # Lazy (re)allocation of the pinned host staging buffer — depends on
+        # the frame shape, which we don't know at __init__ time. Without
+        # pinning, ``Tensor.copy_(..., non_blocking=True)`` silently promotes
+        # to a sync copy.
+        src_shape = frame.shape
+        src_nbytes = frame.nbytes
         pinned = self._fast_src_host_pinned
         if (
             pinned is None
@@ -369,10 +415,7 @@ class RFDetrForInstanceSegmentationTRT(
             self._fast_src_gpu = torch.empty(
                 src_shape, dtype=torch.uint8, device=self._device
             )
-        # Copy the numpy BGR frame into pinned host memory (fast CPU memcpy),
-        # then async DtoH->GPU while the Triton launch happens on CPU side.
-        pinned_np = pinned.numpy()
-        np.copyto(pinned_np, images, casting="no")
+        np.copyto(pinned.numpy(), frame, casting="no")
         src_gpu = self._fast_src_gpu
         with torch.cuda.stream(self._pre_process_stream):
             src_gpu.copy_(pinned, non_blocking=True)
@@ -384,8 +427,7 @@ class RFDetrForInstanceSegmentationTRT(
                 stds=self._fast_stds,
                 out=self._fast_input_buffer,
             )
-            # Record an event so the inference stream can wait on preproc
-            # completion without blocking the CPU.
+            # Inference stream waits on this event instead of blocking CPU.
             self._fast_preproc_event = torch.cuda.Event()
             self._fast_preproc_event.record(self._pre_process_stream)
             self._fast_input_buffer.record_stream(self._pre_process_stream)
@@ -415,7 +457,7 @@ class RFDetrForInstanceSegmentationTRT(
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cache = self._trt_cuda_graph_cache if not disable_cuda_graphs else None
-        ev = getattr(self, "_fast_preproc_event", None)
+        ev = self._fast_preproc_event
         if ev is not None:
             ev.wait(self._inference_stream)
             self._fast_preproc_event = None
@@ -446,9 +488,11 @@ class RFDetrForInstanceSegmentationTRT(
             recommended_parameters=self.recommended_parameters,
             default_confidence=INFERENCE_MODELS_RFDETR_DEFAULT_CONFIDENCE,
         )
-        # Wait on the TRT-stream "produce" event so our post_process stream
-        # can start reading the (graph-owned) output buffers as soon as the
-        # engine finishes, without a CPU-side synchronize().
+        # Contract: see inference_models/models/common/trt.py module
+        # docstring (``_trt_produce_event`` / ``_trt_graph_state``). We wait
+        # on the produce event so post_process can start reading the
+        # (graph-owned) output buffers without a CPU sync, and record into
+        # ``consumer_done_event`` below so the next replay can wait on us.
         produce_event = getattr(model_results[0], "_trt_produce_event", None)
         graph_state = getattr(model_results[0], "_trt_graph_state", None)
         with torch.cuda.stream(self._post_process_stream):

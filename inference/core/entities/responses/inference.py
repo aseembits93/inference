@@ -268,18 +268,22 @@ class InstanceSegmentationInferenceResponse(
 # interface. HTTP / cache / visualization paths still receive the pydantic
 # `InstanceSegmentationInferenceResponse` because they use
 # `source != "workflow-execution"`.
+# Parity: see Point
 @dataclass(slots=True)
 class PointDC:
     x: float
     y: float
 
 
+# Parity: see InferenceResponseImage
 @dataclass(slots=True)
 class InferenceResponseImageDC:
     width: int
     height: int
 
 
+# Parity: see InstanceSegmentationPrediction. Field additions to the pydantic
+# parent must be mirrored here and in `_is_pred_dc_to_dict` below.
 @dataclass(slots=True)
 class InstanceSegmentationPredictionDC:
     x: float
@@ -295,6 +299,8 @@ class InstanceSegmentationPredictionDC:
     class_confidence: object = None
 
 
+# Parity: see InstanceSegmentationInferenceResponse. Field additions to the
+# pydantic parent must be mirrored here and in `_is_response_dc_to_dict` below.
 @dataclass(slots=True)
 class InstanceSegmentationInferenceResponseDC:
     predictions: list  # list[InstanceSegmentationPredictionDC]

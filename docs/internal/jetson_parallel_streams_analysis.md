@@ -1,5 +1,8 @@
 # Roboflow Inference on Jetson — Static Analysis of Parallel-Stream Throughput
 
+> Scoping memo that motivated `perf/optimize-rfdetr-seg-plus-is-seg-dataclasses`.
+> Kept for reference; the optimizations it identified are implemented on that branch.
+
 ## Engine Configuration (RESOLVED)
 
 The `trt_config.json` shipped alongside the `rfdetr-seg-nano` engine is available in-repo as a test asset:

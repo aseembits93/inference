@@ -57,6 +57,12 @@ if USE_PYTORCH_FOR_PREPROCESSING:
 
 RFDETR_USE_TRITON_PREPROC = str2bool(os.getenv("RFDETR_USE_TRITON_PREPROC", False))
 
+# The Triton fast-path is independent of USE_PYTORCH_FOR_PREPROCESSING: it
+# produces a CUDA torch tensor directly from a raw numpy frame, which the
+# downstream ONNX runner accepts via IO-binding regardless of the surrounding
+# preprocessing mode. We import torch here unconditionally (when the flag is
+# set) so the fast path works in deployments that keep the default
+# numpy-preprocessing mode.
 if RFDETR_USE_TRITON_PREPROC:
     try:
         import torch
@@ -180,7 +186,6 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         """
         if (
             _TRITON_PREPROC_READY
-            and USE_PYTORCH_FOR_PREPROCESSING
             and self.resize_method in ("Fit (grey edges) in", "Stretch to")
         ):
             triton_out = self._try_triton_preprocess(image)

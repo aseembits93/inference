@@ -328,32 +328,39 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         predictions: List[InstanceDetections],
         preprocess_return_metadata: PreprocessingMetadata,
         **kwargs,
-    ) -> List[InstanceSegmentationInferenceResponse]:
+    ) -> List[
+        Union[
+            InstanceSegmentationInferenceResponse,
+            InstanceSegmentationInferenceResponseDC,
+        ]
+    ]:
         mapped_kwargs = self.map_inference_kwargs(kwargs)
         detections_list = self._model.post_process(
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
-        gpu_fastpath = os.getenv("RFDETR_GPU_POSTPROCESS", "true").lower() in ("true", "1")
         # Workflow callers consume a plain dict via `_is_response_dc_to_dict`;
         # dataclasses avoid pydantic validation + `model_dump` overhead per
         # frame. Every other caller (HTTP, cache, visualization) keeps the
         # pydantic path because it depends on the pydantic class identity.
         use_dc = kwargs.get("source") == "workflow-execution"
 
-        responses: List[InstanceSegmentationInferenceResponse] = []
+        responses: List[
+            Union[
+                InstanceSegmentationInferenceResponse,
+                InstanceSegmentationInferenceResponseDC,
+            ]
+        ] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):
             H = preproc_metadata.original_size.height
             W = preproc_metadata.original_size.width
 
-            # Fast path: triton_rfdetr_fullpost returns UNSLICED buffers plus
-            # a GPU counter tensor and a done-event. We:
-            #   (1) wait the done-event on the current stream so post_process
-            #       stream writes are visible,
-            #   (2) async-DtoH the 4-byte counter into a pinned host buffer
-            #       and sync once — this replaces the old in-kernel
-            #       counter.item() that blocked the postproc stream,
-            #   (3) slice combined/mask to n_survivors and async-DtoH both,
-            #       then sync.
+            # Fast path for the RF-DETR full-postproc Triton fusion. Contract:
+            # see inference_models/models/rfdetr/common.py module docstring
+            # (``_combined_gpu`` / ``_counter_gpu`` / ``_postproc_done_event``).
+            # We (1) wait the done-event on the current stream, (2) async-DtoH
+            # the 4-byte counter into a pinned host buffer and sync once to
+            # learn ``n_survivors`` without blocking the postproc stream,
+            # (3) slice and async-DtoH the combined + mask buffers.
             combined_gpu = getattr(det, "_combined_gpu", None)
             counter_gpu = getattr(det, "_counter_gpu", None)
             done_event = getattr(det, "_postproc_done_event", None)
