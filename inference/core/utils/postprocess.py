@@ -125,23 +125,6 @@ def mask2poly(mask: np.ndarray) -> np.ndarray:
     return contours.astype("float32")
 
 
-def mask2multipoly(mask: np.ndarray) -> np.ndarray:
-    """
-    Find all contours in the mask and return them as a float32 array.
-
-    Args:
-        mask (np.ndarray): A binary mask.
-
-    Returns:
-        np.ndarray: Contours represented as a float32 array.
-    """
-    contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
-    if contours:
-        contours = [c.reshape(-1, 2).astype("float32") for c in contours]
-    else:
-        contours = [np.zeros((0, 2)).astype("float32")]
-    return contours
-
 
 def post_process_bboxes(
     predictions: List[List[List[float]]],
