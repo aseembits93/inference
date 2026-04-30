@@ -400,34 +400,31 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             polys = masks2poly(masks)
 
             predictions: List[InstanceSegmentationPrediction] = []
+            class_filter = kwargs.get("class_filter")
+            _class_names = self.class_names
+            _n_classes = len(_class_names)
 
             for (x1, y1, x2, y2), mask_as_poly, conf, class_id in zip(
                 xyxy, polys, confs, class_ids
             ):
-                cx = (float(x1) + float(x2)) / 2.0
-                cy = (float(y1) + float(y2)) / 2.0
-                w = float(x2) - float(x1)
-                h = float(y2) - float(y1)
                 class_id_int = int(class_id)
                 class_name = (
-                    self.class_names[class_id_int]
-                    if 0 <= class_id_int < len(self.class_names)
+                    _class_names[class_id_int]
+                    if 0 <= class_id_int < _n_classes
                     else str(class_id_int)
                 )
-                if (
-                    kwargs.get("class_filter")
-                    and class_name not in kwargs["class_filter"]
-                ):
+                if class_filter and class_name not in class_filter:
                     continue
                 predictions.append(
                     InstanceSegmentationPrediction(
-                        x=cx,
-                        y=cy,
-                        width=w,
-                        height=h,
+                        x=(float(x1) + float(x2)) * 0.5,
+                        y=(float(y1) + float(y2)) * 0.5,
+                        width=float(x2) - float(x1),
+                        height=float(y2) - float(y1),
                         confidence=float(conf),
                         points=[
-                            Point(x=point[0], y=point[1]) for point in mask_as_poly
+                            Point(x=float(p[0]), y=float(p[1]))
+                            for p in mask_as_poly
                         ],
                         **{"class": class_name},
                         class_id=class_id_int,

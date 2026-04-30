@@ -116,17 +116,23 @@ def convert_inference_detections_batch_to_sv_detections(
         raw_predictions = p[predictions_key]
         if len(detections) != len(raw_predictions):
             raw_predictions = filter_out_invalid_polygons(predictions=raw_predictions)
-        parent_ids = [d.get(PARENT_ID_KEY, "") for d in raw_predictions]
-        detection_ids = [
-            d.get(DETECTION_ID_KEY, str(uuid.uuid4())) for d in raw_predictions
-        ]
-        detections[DETECTION_ID_KEY] = np.array(detection_ids)
-        detections[PARENT_ID_KEY] = np.array(parent_ids)
-        detections[IMAGE_DIMENSIONS_KEY] = np.array([[height, width]] * len(detections))
+        n_raw = len(raw_predictions)
+        parent_ids = np.empty(n_raw, dtype=object)
+        detection_ids = np.empty(n_raw, dtype=object)
+        _uuid4 = uuid.uuid4
+        for j, d in enumerate(raw_predictions):
+            parent_ids[j] = d.get(PARENT_ID_KEY, "")
+            detection_ids[j] = d.get(DETECTION_ID_KEY) or str(_uuid4())
+        detections[DETECTION_ID_KEY] = detection_ids
+        detections[PARENT_ID_KEY] = parent_ids
+        detections[IMAGE_DIMENSIONS_KEY] = np.broadcast_to(
+            np.array([[height, width]]), (len(detections), 2)
+        ).copy()
         if INFERENCE_ID_KEY in p:
-            detections[INFERENCE_ID_KEY] = np.array(
-                [p[INFERENCE_ID_KEY]] * len(detections)
-            )
+            n = len(detections)
+            inf_id = np.empty(n, dtype=object)
+            inf_id[:] = p[INFERENCE_ID_KEY]
+            detections[INFERENCE_ID_KEY] = inf_id
         batch_of_detections.append(detections)
     return batch_of_detections
 

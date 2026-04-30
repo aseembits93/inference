@@ -259,6 +259,48 @@ class InstanceSegmentationInferenceResponse(
 
     predictions: List[InstanceSegmentationPrediction]
 
+    def model_dump(self, *, by_alias: bool = False, exclude_none: bool = False, **kw):
+        if not (by_alias and exclude_none) or kw.get("exclude") or kw.get("include"):
+            return super().model_dump(
+                by_alias=by_alias, exclude_none=exclude_none, **kw
+            )
+
+        img = self.image
+        if isinstance(img, list):
+            img_dict = [{"width": i.width, "height": i.height} for i in img]
+        else:
+            img_dict = {"width": img.width, "height": img.height}
+
+        preds = []
+        for p in self.predictions:
+            d = {
+                "x": p.x,
+                "y": p.y,
+                "width": p.width,
+                "height": p.height,
+                "confidence": p.confidence,
+                "class": p.class_name,
+                "class_id": p.class_id,
+                "detection_id": p.detection_id,
+                "points": [{"x": pt.x, "y": pt.y} for pt in p.points],
+            }
+            if p.class_confidence is not None:
+                d["class_confidence"] = p.class_confidence
+            if p.parent_id is not None:
+                d["parent_id"] = p.parent_id
+            preds.append(d)
+
+        result: Dict[str, Any] = {"predictions": preds, "image": img_dict}
+        if self.inference_id is not None:
+            result["inference_id"] = self.inference_id
+        if self.frame_id is not None:
+            result["frame_id"] = self.frame_id
+        if self.time is not None:
+            result["time"] = self.time
+        if self.visualization is not None:
+            result["visualization"] = self.visualization
+        return result
+
 
 class SemanticSegmentationInferenceResponse(
     CvInferenceResponse, WithVisualizationResponse

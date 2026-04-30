@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from typing import Dict, List, Tuple, Union
 
@@ -34,30 +35,37 @@ def masks2poly(masks: np.ndarray) -> List[np.ndarray]:
     Returns:
         list: A list of segments, where each segment is obtained by converting the corresponding mask.
     """
-    segments = []
-    # Process per-mask to avoid allocating an entire N x H x W uint8 copy
-    for mask in masks:
-        # Fast-path: bool -> zero-copy uint8 view
-        if mask.dtype == np.bool_:
-            m_uint8 = mask
-            if not m_uint8.flags.c_contiguous:
-                m_uint8 = np.ascontiguousarray(m_uint8)
-            m_uint8 = m_uint8.view(np.uint8)
-        elif mask.dtype == np.uint8:
-            m_uint8 = mask if mask.flags.c_contiguous else np.ascontiguousarray(mask)
-        else:
-            # Fallback: threshold to bool then view as uint8 (may allocate once)
-            m_bool = mask > 0
-            if not m_bool.flags.c_contiguous:
-                m_bool = np.ascontiguousarray(m_bool)
-            m_uint8 = m_bool.view(np.uint8)
+    n = masks.shape[0]
+    if n == 0:
+        return []
 
-        # Quickly skip empty masks
-        if not np.any(m_uint8):
-            segments.append(np.zeros((0, 2), dtype=np.float32))
-            continue
+    if masks.dtype == np.bool_:
+        if not masks.flags.c_contiguous:
+            masks = np.ascontiguousarray(masks)
+        masks_u8 = masks.view(np.uint8)
+    elif masks.dtype == np.uint8:
+        masks_u8 = masks if masks.flags.c_contiguous else np.ascontiguousarray(masks)
+    else:
+        m_bool = masks > 0
+        if not m_bool.flags.c_contiguous:
+            m_bool = np.ascontiguousarray(m_bool)
+        masks_u8 = m_bool.view(np.uint8)
 
-        segments.append(mask2poly(m_uint8))
+    _empty = np.zeros((0, 2), dtype=np.float32)
+
+    def _trace(m):
+        contours = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+        if contours:
+            c = contours[0] if len(contours) == 1 else max(contours, key=len)
+            return c.reshape(-1, 2).astype(np.float32)
+        return _empty
+
+    _THREAD_THRESHOLD = 16
+    if n >= _THREAD_THRESHOLD:
+        with ThreadPoolExecutor() as pool:
+            segments = list(pool.map(_trace, (masks_u8[i] for i in range(n))))
+    else:
+        segments = [_trace(masks_u8[i]) for i in range(n)]
     return segments
 
 
@@ -70,30 +78,30 @@ def masks2multipoly(masks: np.ndarray) -> List[np.ndarray]:
     Returns:
         list: A list of segments, where each segment is obtained by converting the corresponding mask.
     """
+    n = masks.shape[0]
+    if n == 0:
+        return []
+
+    if masks.dtype == np.bool_:
+        if not masks.flags.c_contiguous:
+            masks = np.ascontiguousarray(masks)
+        masks_u8 = masks.view(np.uint8)
+    elif masks.dtype == np.uint8:
+        masks_u8 = masks if masks.flags.c_contiguous else np.ascontiguousarray(masks)
+    else:
+        m_bool = masks > 0
+        if not m_bool.flags.c_contiguous:
+            m_bool = np.ascontiguousarray(m_bool)
+        masks_u8 = m_bool.view(np.uint8)
+
+    _empty = [np.zeros((0, 2), dtype=np.float32)]
     segments = []
-    # Process per-mask to avoid allocating an entire N x H x W uint8 copy
-    for mask in masks:
-        # Fast-path: bool -> zero-copy uint8 view
-        if mask.dtype == np.bool_:
-            m_uint8 = mask
-            if not m_uint8.flags.c_contiguous:
-                m_uint8 = np.ascontiguousarray(m_uint8)
-            m_uint8 = m_uint8.view(np.uint8)
-        elif mask.dtype == np.uint8:
-            m_uint8 = mask if mask.flags.c_contiguous else np.ascontiguousarray(mask)
+    for i in range(n):
+        contours = cv2.findContours(masks_u8[i], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+        if contours:
+            segments.append([c.reshape(-1, 2).astype(np.float32) for c in contours])
         else:
-            # Fallback: threshold to bool then view as uint8 (may allocate once)
-            m_bool = mask > 0
-            if not m_bool.flags.c_contiguous:
-                m_bool = np.ascontiguousarray(m_bool)
-            m_uint8 = m_bool.view(np.uint8)
-
-        # Quickly skip empty masks
-        if not np.any(m_uint8):
-            segments.append([np.zeros((0, 2), dtype=np.float32)])
-            continue
-
-        segments.append(mask2multipoly(m_uint8))
+            segments.append(_empty)
     return segments
 
 
