@@ -15,6 +15,7 @@ from inference.core.env import (
     WORKFLOWS_REMOTE_EXECUTION_MAX_STEP_BATCH_SIZE,
     WORKFLOWS_REMOTE_EXECUTION_MAX_STEP_CONCURRENT_REQUESTS,
 )
+from inference.core.entities.responses.inference import SV_DETECTIONS_FAST_ATTR
 from inference.core.managers.base import ModelManager
 from inference.core.workflows.core_steps.common.entities import StepExecutionMode
 from inference.core.workflows.core_steps.common.utils import (
@@ -27,7 +28,6 @@ from inference.core.workflows.execution_engine.constants import (
     DETECTION_ID_KEY,
     IMAGE_DIMENSIONS_KEY,
     INFERENCE_ID_KEY,
-    PARENT_ID_KEY,
 )
 from inference.core.workflows.execution_engine.entities.base import (
     Batch,
@@ -335,10 +335,7 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
         )
         if not isinstance(predictions, list):
             predictions = [predictions]
-        # Fast path: the adapter attaches a pre-built `sv.Detections` when the
-        # request's source is `workflow-execution`, letting us skip the
-        # mask → polygon → mask round-trip via `model_dump` + `from_inference`.
-        sv_fast = [p.__dict__.get("_sv_detections_fast") for p in predictions]
+        sv_fast = [p.__dict__.get(SV_DETECTIONS_FAST_ATTR) for p in predictions]
         if all(det is not None for det in sv_fast):
             inference_ids = [p.inference_id for p in predictions]
             return self._post_process_result_fast(
@@ -452,9 +449,6 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
         class_filter: Optional[List[str]],
         model_id: str,
     ) -> BlockResult:
-        # Skips the dict → sv.Detections conversion (which would
-        # `polygon_to_mask` each detection) because the adapter already
-        # produced a ready-to-use `sv.Detections`.
         augmented: List[sv.Detections] = []
         for image, detections, inference_id in zip(
             images, sv_detections, inference_ids
@@ -463,9 +457,6 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
             detections[DETECTION_ID_KEY] = np.array(
                 [str(uuid.uuid4()) for _ in range(n)]
             )
-            detections[PARENT_ID_KEY] = np.array([""] * n)
-            # image.numpy_image is the frame actually inferred on; shape
-            # matches the (H, W) baked into the sv_detections masks.
             h, w = image.numpy_image.shape[:2]
             detections[IMAGE_DIMENSIONS_KEY] = np.array([[h, w]] * n)
             if inference_id is not None:

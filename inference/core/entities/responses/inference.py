@@ -4,6 +4,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_serializer
 
+# Attr name the instance-segmentation fast path uses on response.__dict__ to
+# hand a pre-built sv.Detections to the v3 workflow block without going through
+# pydantic serialization. Pydantic v2 ignores extra __dict__ keys in
+# model_dump/jsonable_encoder, so this never leaks into serialized output.
+SV_DETECTIONS_FAST_ATTR = "_sv_detections_fast"
+
 
 class ObjectDetectionPrediction(BaseModel):
     """Object Detection prediction.
