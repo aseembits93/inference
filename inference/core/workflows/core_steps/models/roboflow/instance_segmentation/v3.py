@@ -5,6 +5,10 @@ from pydantic import ConfigDict, Field, PositiveInt, model_validator
 from inference.core.entities.requests.inference import (
     InstanceSegmentationInferenceRequest,
 )
+from inference.core.entities.responses.inference import (
+    InstanceSegmentationInferenceResponseDC,
+    _is_response_dc_to_dict,
+)
 from inference.core.env import (
     HOSTED_INSTANCE_SEGMENTATION_URL,
     LOCAL_INFERENCE_API_URL,
@@ -327,8 +331,15 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
         )
         if not isinstance(predictions, list):
             predictions = [predictions]
+        # The adapter returns dataclass responses when source="workflow-execution"
+        # (cheaper construct + dict-walk than pydantic). Any other response type
+        # (e.g. if a non-rfdetr backend is bound to the same block) falls back
+        # to `model_dump`.
         predictions = [
-            e.model_dump(by_alias=True, exclude_none=True) for e in predictions
+            _is_response_dc_to_dict(e)
+            if isinstance(e, InstanceSegmentationInferenceResponseDC)
+            else e.model_dump(by_alias=True, exclude_none=True)
+            for e in predictions
         ]
         return self._post_process_result(
             images=images,
