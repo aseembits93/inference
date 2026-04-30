@@ -5,9 +5,11 @@ from time import perf_counter
 from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
+import supervision as sv
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from pycocotools import mask as mask_utils
+from supervision.config import CLASS_NAME_DATA_FIELD
 
 from inference.core.entities.requests import (
     ClassificationInferenceRequest,
@@ -313,6 +315,18 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
 
+        # Workflow callers consume an `sv.Detections` via the v3 block and
+        # don't need the per-detection polygon/pydantic-prediction encoding.
+        # When we detect that caller we attach a pre-built `sv.Detections`
+        # to the response and skip `masks2poly` + `InstanceSegmentationPrediction`
+        # construction entirely. The workflow block then bypasses
+        # `model_dump` + `sv.Detections.from_inference` (which would rasterize
+        # the polygons we just produced back into masks).
+        is_workflow = (
+            kwargs.get("source") == "workflow-execution" and not return_in_rle
+        )
+        class_filter = kwargs.get("class_filter")
+
         responses: List[InstanceSegmentationInferenceResponse] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):
             H = preproc_metadata.original_size.height
@@ -320,6 +334,22 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
 
             xyxy = det.xyxy.detach().cpu().numpy()
             confs = det.confidence.detach().cpu().numpy()
+            class_ids = det.class_id.detach().cpu().numpy()
+
+            if is_workflow and isinstance(det.mask, torch.Tensor):
+                masks_np = det.mask.detach().cpu().numpy()
+                response = self._build_workflow_fastpath_response(
+                    xyxy=xyxy,
+                    confs=confs,
+                    class_ids=class_ids,
+                    masks=masks_np,
+                    class_filter=class_filter,
+                    width=W,
+                    height=H,
+                )
+                responses.append(response)
+                continue
+
             if isinstance(det.mask, torch.Tensor):
                 masks = det.mask.detach().cpu().numpy()
                 if return_in_rle:
@@ -333,7 +363,6 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                     polys_or_rles = det.mask.to_coco_rle_masks()
                 else:
                     polys_or_rles = rle_masks2poly(det.mask)
-            class_ids = det.class_id.detach().cpu().numpy()
 
             predictions: List[
                 Union[InstanceSegmentationPrediction, InstanceSegmentationRLEPrediction]
@@ -398,6 +427,76 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                 )
             )
         return responses
+
+    def _build_workflow_fastpath_response(
+        self,
+        xyxy: np.ndarray,
+        confs: np.ndarray,
+        class_ids: np.ndarray,
+        masks: np.ndarray,
+        class_filter: Optional[List[str]],
+        width: int,
+        height: int,
+    ) -> InstanceSegmentationInferenceResponse:
+        n = int(class_ids.shape[0]) if class_ids.ndim else 0
+        class_names_map = self.class_names
+        n_classes = len(class_names_map)
+
+        if n == 0:
+            sv_dets = sv.Detections.empty()
+            sv_dets.data = {CLASS_NAME_DATA_FIELD: np.empty(0, dtype=object)}
+        else:
+            class_id_int = class_ids.astype(np.int64, copy=False)
+            in_range = (class_id_int >= 0) & (class_id_int < n_classes)
+            class_name_arr = np.empty(n, dtype=object)
+            if in_range.all():
+                for i, cid in enumerate(class_id_int):
+                    class_name_arr[i] = class_names_map[int(cid)]
+            else:
+                for i, cid in enumerate(class_id_int):
+                    ci = int(cid)
+                    class_name_arr[i] = (
+                        class_names_map[ci] if 0 <= ci < n_classes else str(ci)
+                    )
+
+            if class_filter:
+                keep = np.fromiter(
+                    (name in class_filter for name in class_name_arr),
+                    dtype=bool,
+                    count=n,
+                )
+                if not keep.all():
+                    xyxy = xyxy[keep]
+                    confs = confs[keep]
+                    class_id_int = class_id_int[keep]
+                    class_name_arr = class_name_arr[keep]
+                    masks = masks[keep]
+
+            xyxy_f = (
+                xyxy.astype(np.float32, copy=False)
+                if xyxy.dtype != np.float32
+                else xyxy
+            )
+            mask_bool = (
+                masks.astype(bool, copy=False) if masks.dtype != np.bool_ else masks
+            )
+            sv_dets = sv.Detections(
+                xyxy=xyxy_f,
+                confidence=confs.astype(np.float32, copy=False),
+                class_id=class_id_int.astype(int, copy=False),
+                mask=mask_bool if mask_bool.size else None,
+                data={CLASS_NAME_DATA_FIELD: class_name_arr},
+            )
+
+        response = InstanceSegmentationInferenceResponse(
+            predictions=[],
+            image=InferenceResponseImage(width=width, height=height),
+        )
+        # Stash the pre-built sv.Detections for the v3 workflow block to pick
+        # up. Pydantic v2 ignores extra __dict__ keys in model_dump and
+        # jsonable_encoder, so this never leaks into serialized output.
+        response.__dict__["_sv_detections_fast"] = sv_dets
+        return response
 
     def clear_cache(self, delete_from_disk: bool = True) -> None:
         """Clears any cache if necessary. TODO: Implement this to delete the cache from the experimental model.
