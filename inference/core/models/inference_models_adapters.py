@@ -365,12 +365,39 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         # stream therefore returns a `_PrimingSentinel` that `postprocess`
         # recognises as "no output to emit yet". Callers are expected to
         # call `flush()` at stream end to drain the final pending future.
+        #
+        # BEFORE submitting frame N's forward, we eagerly enqueue frame
+        # N-1's postprocess GPU kernels. This re-orders the device queue
+        # so the ~200µs postproc runs BEFORE the next ~9.5ms forward —
+        # without this, nsys traces show postproc kernels waiting ~2ms
+        # (median, 10ms worst case) behind the forward on ~94% of frames,
+        # and that wait reflects directly as host-side
+        # stream.synchronize() latency inside postprocess. The change is
+        # purely a GPU-scheduling reorder — all CPU-visible results still
+        # happen in the same spots.
+        prev = self._prev_future
+        if prev is not None:
+            # prev here is a `_DirectInferenceFuture`. We need the
+            # metadata belonging to the frame that produced it, not the
+            # current frame. The adapter keeps this in
+            # `_pending_flush_meta_prev` (stashed by the previous
+            # `postprocess` call). Pass it in so `post_process` can
+            # compute box coordinates against the right image size.
+            prev_meta = getattr(self, "_pending_flush_meta_prev", None)
+            prev_adapter_kwargs = self._prev_kwargs
+            if prev_meta is not None and prev_adapter_kwargs is not None:
+                # Splice the correct meta + kwargs into the future so the
+                # eager GPU submit happens with the right call state.
+                prev._meta = prev_meta  # type: ignore[attr-defined]
+                prev._kwargs = prev_adapter_kwargs.get("mapped_kwargs", {})  # type: ignore[attr-defined]
+                submit = getattr(prev, "submit_gpu_work", None)
+                if submit is not None:
+                    submit(prev_meta)
         # NB: forward_async's meta arg is unused here because the adapter
         # carries preprocess metadata through `_pending_flush_meta_prev`
         # and splices it into the future inside `_finalize_future`. We only
         # need the future to hold the raw forward output + produce-event.
         fut = self._model.forward_async(img_in, None, **mapped_kwargs)
-        prev = self._prev_future
         prev_kwargs = self._prev_kwargs
         self._prev_future = fut
         self._prev_kwargs = {"mapped_kwargs": mapped_kwargs}
