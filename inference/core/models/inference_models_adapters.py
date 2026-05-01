@@ -60,6 +60,11 @@ from inference_models import (
     PreProcessingOverrides,
     SemanticSegmentationModel,
 )
+<<<<<<< HEAD
+from inference_models.models.base.instance_segmentation import InferenceFuture
+from inference_models.models.base.semantic_segmentation import (
+    SemanticSegmentationResult,
+)
 from inference_models.models.base.types import InstancesRLEMasks, PreprocessingMetadata
 from inference_models.models.common.rle_utils import torch_mask_to_coco_rle
 
@@ -101,6 +106,16 @@ def get_pinned_buffer(name: str, shape, dtype: torch.dtype) -> torch.Tensor:
     buf = torch.empty(shape, dtype=dtype, pin_memory=True)
     PINNED_HOST_BUFFERS[key] = buf
     return buf
+
+
+class _PipelinePrimingSentinel:
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return "<_PIPELINE_PRIMING>"
+
+
+_PIPELINE_PRIMING = _PipelinePrimingSentinel()
 
 
 class InferenceModelsObjectDetectionAdapter(Model):
@@ -286,6 +301,21 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             **kwargs,
         )
         self.class_names = list(self._model.class_names)
+        # Two-stage pipelining: depth=1 means original synchronous behavior
+        # (preprocess→forward→postprocess on each frame, in order); depth=2
+        # overlaps frame N+1's preprocess+forward with frame N's postprocess
+        # decode by stashing a future and deferring CPU-side response build
+        # by one frame. depth=2 requires that callers accept a one-frame
+        # priming latency at stream start and call `flush()` at stream end.
+        self._pipeline_depth = max(
+            1, int(os.getenv("RFDETR_PIPELINE_DEPTH", "1"))
+        )
+        # Per-adapter in-flight future + metadata for the previous frame,
+        # held across the (predict → postprocess) boundary of the current
+        # frame. Not thread-safe; the InferencePipeline is single-producer
+        # and the adapter is owned by a single worker.
+        self._prev_future: Optional[InferenceFuture] = None
+        self._prev_kwargs: Optional[dict] = None
 
     def map_inference_kwargs(self, kwargs: dict) -> dict:
         kwargs["input_color_format"] = "bgr"
@@ -316,9 +346,132 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
 
     def predict(self, img_in, **kwargs):
         mapped_kwargs = self.map_inference_kwargs(kwargs)
-        return self._model.forward(img_in, **mapped_kwargs)
+        if self._pipeline_depth <= 1:
+            # Original path: forward on current frame, postprocess on
+            # current frame, all synchronous.
+            return self._model.forward(img_in, **mapped_kwargs)
+
+        # Depth-2 path: enqueue forward for the *current* frame onto the
+        # inference stream (which releases the host immediately thanks to
+        # the captured TRT CUDA graph), park the resulting future in
+        # `_prev_future`, and return the *previous* future — which will be
+        # decoded during this call's `postprocess`. The first frame of a
+        # stream therefore returns a `_PrimingSentinel` that `postprocess`
+        # recognises as "no output to emit yet". Callers are expected to
+        # call `flush()` at stream end to drain the final pending future.
+        # NB: forward_async's meta arg is unused here because the adapter
+        # carries preprocess metadata through `_pending_flush_meta_prev`
+        # and splices it into the future inside `_finalize_future`. We only
+        # need the future to hold the raw forward output + produce-event.
+        fut = self._model.forward_async(img_in, None, **mapped_kwargs)
+        prev = self._prev_future
+        prev_kwargs = self._prev_kwargs
+        self._prev_future = fut
+        self._prev_kwargs = {"mapped_kwargs": mapped_kwargs}
+        if prev is None:
+            return _PIPELINE_PRIMING
+        # Stash previous call's mapped_kwargs on the future so postprocess
+        # can reconstruct post_process args without depending on the
+        # current frame's kwargs.
+        prev._adapter_kwargs = prev_kwargs  # type: ignore[attr-defined]
+        return prev
+
+    def flush(self) -> List[InstanceSegmentationInferenceResponse]:
+        """Drain the tail of the pipelined queue.
+
+        Returns responses for any in-flight frames whose forward pass was
+        submitted but whose postprocess has not yet been driven by a
+        subsequent call to `postprocess`. Callers that use
+        `RFDETR_PIPELINE_DEPTH>=2` MUST invoke this at stream end or the
+        final frame will be dropped.
+        """
+        if self._pipeline_depth <= 1:
+            return []
+        fut = self._prev_future
+        kw = self._prev_kwargs
+        self._prev_future = None
+        self._prev_kwargs = None
+        if fut is None:
+            return []
+        # The future's preprocess metadata was passed in as `None` during
+        # predict, so `post_process` has no size/offset info to work with.
+        # That metadata must have been stashed by the caller before flush
+        # — in the InferencePipeline path it lives on the adapter's
+        # `_flush_meta` stack (populated during postprocess).
+        meta = getattr(self, "_pending_flush_meta", None)
+        self._pending_flush_meta = None
+        if meta is None:
+            return []
+        return self._finalize_future(fut, meta, (kw or {}).get("mapped_kwargs", {}))
 
     def postprocess(
+        self,
+        predictions,
+        preprocess_return_metadata: PreprocessingMetadata,
+        **kwargs,
+    ) -> List[InstanceSegmentationInferenceResponse]:
+        if self._pipeline_depth <= 1:
+            return self._postprocess_sync(
+                predictions, preprocess_return_metadata, **kwargs
+            )
+        # Depth-2 path: `predictions` is either `_PIPELINE_PRIMING` (first
+        # frame: emit empty list so the pipeline advances) or a prior
+        # frame's InferenceFuture. Either way, stash the current frame's
+        # preprocess metadata on the adapter so `flush()` can use it to
+        # decode the in-flight future at stream end.
+        self._pending_flush_meta = preprocess_return_metadata
+        if predictions is _PIPELINE_PRIMING:
+            # Stash the priming frame's metadata so the NEXT postprocess
+            # (which will receive the priming frame's future) can decode
+            # boxes into pixel coordinates that match this frame.
+            self._pending_flush_meta_prev = preprocess_return_metadata
+            # Return empty responses for the first frame so the stream
+            # pipeline has something to dispatch. The real frame-0 output
+            # arrives one frame later.
+            return [
+                InstanceSegmentationInferenceResponse(
+                    predictions=[],
+                    image=InferenceResponseImage(
+                        width=m.original_size.width,
+                        height=m.original_size.height,
+                    ),
+                )
+                for m in preprocess_return_metadata
+            ]
+        fut: InferenceFuture = predictions
+        # `preprocess_return_metadata` here corresponds to the *current*
+        # frame but the future belongs to the *previous* frame. Use the
+        # metadata that was stashed one call ago: we kept it as
+        # `_pending_flush_meta_prev` from the previous postprocess.
+        prev_meta = getattr(self, "_pending_flush_meta_prev", None)
+        self._pending_flush_meta_prev = preprocess_return_metadata
+        if prev_meta is None:
+            # Should not happen under normal sequence (first postprocess
+            # took the priming branch above), but be defensive.
+            prev_meta = preprocess_return_metadata
+        mapped_kwargs = getattr(fut, "_adapter_kwargs", {}).get(
+            "mapped_kwargs", {}
+        )
+        return self._finalize_future(fut, prev_meta, mapped_kwargs)
+
+    def _finalize_future(
+        self,
+        fut: InferenceFuture,
+        preprocess_return_metadata: PreprocessingMetadata,
+        mapped_kwargs: dict,
+    ) -> List[InstanceSegmentationInferenceResponse]:
+        # Override the future's stashed meta (which was `None` at submit
+        # time) with the correct metadata for the frame whose forward pass
+        # the future represents. This is an allowed private-surface tweak
+        # because _DirectInferenceFuture's post_process is memoised.
+        fut._meta = preprocess_return_metadata  # type: ignore[attr-defined]
+        fut._kwargs = mapped_kwargs  # type: ignore[attr-defined]
+        detections_list = fut.result()
+        return self._build_responses_from_detections(
+            detections_list, preprocess_return_metadata, **mapped_kwargs
+        )
+
+    def _postprocess_sync(
         self,
         predictions: List[InstanceDetections],
         preprocess_return_metadata: PreprocessingMetadata,
@@ -330,6 +483,17 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         detections_list = self._model.post_process(
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
+        return self._build_responses_from_detections(
+            detections_list, preprocess_return_metadata, **kwargs
+        )
+
+    def _build_responses_from_detections(
+        self,
+        detections_list: List[InstanceDetections],
+        preprocess_return_metadata: PreprocessingMetadata,
+        **kwargs,
+    ) -> List[InstanceSegmentationInferenceResponse]:
+        return_in_rle = kwargs.get("response_mask_format") == "rle"
 
         responses: List[InstanceSegmentationInferenceResponse] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):

@@ -504,6 +504,70 @@ class RFDetrForInstanceSegmentationTRT(
                 )
                 return detections, labels, masks
 
+    def forward_async(
+        self,
+        pre_processed_images: torch.Tensor,
+        pre_processing_meta,
+        **kwargs,
+    ):
+        """Async launch variant that isolates graph outputs per-call.
+
+        The captured TRT CUDA graph reuses a single set of output buffers
+        across replays; in depth-2 pipelining, the caller enqueues the
+        next forward (and therefore the next graph replay, which writes
+        into those same buffers) BEFORE the postprocess for the previous
+        forward has read them. To make the returned future safe across
+        that boundary we clone the graph-owned outputs onto the inference
+        stream immediately after the replay, and record the produce event
+        AND consumer-done event on the clones' stream so:
+
+          - postprocess waits on produce_event (seeing the clone's final
+            writes), and
+          - the next graph replay can proceed as soon as the clone is
+            done copying, because consumer_done_event is recorded right
+            after the clone (the graph's output buffer is free by then).
+
+        Non-graph path returns newly-allocated tensors already, so cloning
+        there is a no-op; we reuse the base `forward_async` in that case.
+        """
+        raw = self.forward(pre_processed_images, **kwargs)
+        graph_state = getattr(raw[0], "_trt_graph_state", None)
+        if graph_state is None:
+            # Non-graph (execute_async_v3) path: outputs are freshly
+            # allocated per call, no aliasing hazard.
+            return super().forward_async(
+                pre_processed_images, pre_processing_meta, **kwargs
+            )
+        produce_event = getattr(raw[0], "_trt_produce_event", None)
+        stream = graph_state.cuda_stream
+        # Clone on the inference stream so the copy is ordered AFTER the
+        # graph replay finishes, without blocking the host. After clone,
+        # record consumer_done so the next replay can overwrite buffers.
+        with torch.cuda.stream(stream):
+            clones = tuple(t.clone() for t in raw)
+        # The clones inherit the graph produce event for downstream wait,
+        # but they are NOT aliased to graph-owned memory. Postprocess
+        # will wait on this event before reading, which also covers the
+        # in-stream ordering of the clone itself (same stream).
+        if produce_event is not None:
+            clones[0]._trt_produce_event = produce_event  # type: ignore[attr-defined]
+        # Record consumer-done right after clone so next replay can
+        # proceed independently of postprocess.
+        ev = graph_state.consumer_done_event
+        if ev is None:
+            ev = torch.cuda.Event()
+            graph_state.consumer_done_event = ev
+        ev.record(stream)
+        # Hand the clones to the base future. Graph state is intentionally
+        # NOT attached to the clones (they don't alias graph memory, so
+        # post_process's "record consumer_done" step would be a no-op).
+        from inference_models.models.base.instance_segmentation import (
+            _DirectInferenceFuture,
+        )
+        return _DirectInferenceFuture(
+            self, clones, pre_processing_meta, produce_event, kwargs
+        )
+
     def post_process(
         self,
         model_results: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
