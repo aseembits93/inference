@@ -88,6 +88,41 @@ class _DirectInferenceFuture:
             return True
         return self._evt.query()
 
+    def submit_gpu_work(self, meta: Any = None) -> None:
+        """Enqueue the ``post_process`` GPU work eagerly.
+
+        Under depth>=2 pipelining the CPU-side order normally runs as
+        ``predict(N) → postprocess(N)`` where ``postprocess(N)`` invokes
+        ``result()`` on frame N-1's future. ``result()`` enqueues the
+        postproc kernels only lazily on the postproc stream. Because by
+        then we have already submitted frame N's forward via ``predict(N)``
+        (which dominates GPU time), the GPU queue sees the order
+        ``forward_N → postproc_{N-1}`` even though they run on different
+        streams — and on devices where streams share SMs (Orin), the
+        postproc kernels end up waiting behind the forward.
+
+        Calling ``submit_gpu_work`` from the adapter BEFORE it submits the
+        next forward re-orders the GPU queue to ``postproc_{N-1} →
+        forward_N``, so the tiny (~200µs) postproc finishes first and its
+        done-event fires before the adapter's host-side stream.synchronize
+        runs.
+
+        Idempotent: calling it once is enough; subsequent calls to
+        ``result()`` reuse the enqueued postproc result.
+        """
+        if self._cached is not _MISSING:
+            return
+        if meta is None:
+            meta = self._meta
+        else:
+            self._meta = meta
+        # `post_process` is expected to be non-blocking: it enqueues its
+        # CUDA kernels on a private stream and returns a handle/structure
+        # that the caller reads later. The host does NOT block here.
+        self._cached = self._model.post_process(
+            self._raw, meta, **self._kwargs
+        )
+
     def result(self) -> List["InstanceDetections"]:
         # No host sync here: post_process() enqueues its GPU work on a
         # dedicated stream and uses stream.wait_event() internally to order
