@@ -205,7 +205,18 @@ class InstanceSegmentationModel(
         images: Union[torch.Tensor, List[torch.Tensor], np.ndarray, List[np.ndarray]],
         **kwargs,
     ) -> List[InstanceDetections]:
-        return self.infer_async(images, **kwargs).result()
+        # Synchronous direct path: pre_process → forward → post_process in
+        # sequence, with no per-call output cloning. The async variant
+        # (``infer_async``) exists for pipelined callers that need to
+        # submit frame N+1 before frame N's output buffers have been read
+        # — cloning makes those callers safe. Here, ``post_process``
+        # consumes the raw forward output immediately, so no clone is
+        # needed and we avoid the ~80µs of DtoD copies on the inference
+        # stream. This keeps the ``infer()`` entry point at maximum
+        # throughput for single-thread, single-model users.
+        pre_processed_images, pre_processing_meta = self.pre_process(images, **kwargs)
+        model_results = self.forward(pre_processed_images, **kwargs)
+        return self.post_process(model_results, pre_processing_meta, **kwargs)
 
     def infer_async(
         self,
