@@ -5,6 +5,18 @@ import cv2
 import numpy as np
 
 from inference.core.exceptions import PostProcessingError
+from inference.core.utils.jit_kernels import (
+    clip_and_round_bboxes_kernel,
+    clip_and_round_keypoints_kernel,
+    crop_mask_kernel,
+    scale_bboxes_kernel,
+    scale_keypoints_kernel,
+    shift_bboxes_kernel,
+    shift_keypoints_kernel,
+    sigmoid_inplace,
+    undo_padding_bboxes_kernel,
+    undo_padding_keypoints_kernel,
+)
 from inference.core.utils.preprocess import (
     STATIC_CROP_KEY,
     static_crop_should_be_applied,
@@ -222,35 +234,36 @@ def undo_image_padding_for_predicted_boxes(
     infer_shape: Tuple[int, int],
     origin_shape: Tuple[int, int],
 ) -> np.ndarray:
+    if predicted_bboxes.size == 0:
+        return predicted_bboxes
     scale = min(infer_shape[0] / origin_shape[0], infer_shape[1] / origin_shape[1])
     inter_h = round(origin_shape[0] * scale)
     inter_w = round(origin_shape[1] * scale)
     pad_x = (infer_shape[1] - inter_w) / 2
     pad_y = (infer_shape[0] - inter_h) / 2
-    predicted_bboxes = shift_bboxes(
-        bboxes=predicted_bboxes, shift_x=-pad_x, shift_y=-pad_y
+    if predicted_bboxes.dtype != np.float64:
+        predicted_bboxes = predicted_bboxes.astype(np.float64)
+    return undo_padding_bboxes_kernel(
+        np.ascontiguousarray(predicted_bboxes),
+        float(pad_x),
+        float(pad_y),
+        float(scale),
     )
-    predicted_bboxes /= scale
-    return predicted_bboxes
 
 
 def clip_boxes_coordinates(
     predicted_bboxes: np.ndarray,
     origin_shape: Tuple[int, int],
 ) -> np.ndarray:
-    predicted_bboxes[:, 0] = np.round(
-        np.clip(predicted_bboxes[:, 0], a_min=0, a_max=origin_shape[1])
+    if predicted_bboxes.size == 0:
+        return predicted_bboxes
+    if predicted_bboxes.dtype != np.float64:
+        predicted_bboxes = predicted_bboxes.astype(np.float64)
+    return clip_and_round_bboxes_kernel(
+        np.ascontiguousarray(predicted_bboxes),
+        float(origin_shape[1]),
+        float(origin_shape[0]),
     )
-    predicted_bboxes[:, 2] = np.round(
-        np.clip(predicted_bboxes[:, 2], a_min=0, a_max=origin_shape[1])
-    )
-    predicted_bboxes[:, 1] = np.round(
-        np.clip(predicted_bboxes[:, 1], a_min=0, a_max=origin_shape[0])
-    )
-    predicted_bboxes[:, 3] = np.round(
-        np.clip(predicted_bboxes[:, 3], a_min=0, a_max=origin_shape[0])
-    )
-    return predicted_bboxes
 
 
 def shift_bboxes(
@@ -258,11 +271,13 @@ def shift_bboxes(
     shift_x: Union[int, float],
     shift_y: Union[int, float],
 ) -> np.ndarray:
-    bboxes[:, 0] += shift_x
-    bboxes[:, 2] += shift_x
-    bboxes[:, 1] += shift_y
-    bboxes[:, 3] += shift_y
-    return bboxes
+    if bboxes.size == 0:
+        return bboxes
+    if bboxes.dtype != np.float64:
+        bboxes = bboxes.astype(np.float64)
+    return shift_bboxes_kernel(
+        np.ascontiguousarray(bboxes), float(shift_x), float(shift_y)
+    )
 
 
 def process_mask_accurate(
@@ -403,30 +418,28 @@ def preprocess_segmentation_masks(
 
 
 def scale_bboxes(bboxes: np.ndarray, scale_x: float, scale_y: float) -> np.ndarray:
-    bboxes[:, 0] *= scale_x
-    bboxes[:, 2] *= scale_x
-    bboxes[:, 1] *= scale_y
-    bboxes[:, 3] *= scale_y
-    return bboxes
+    if bboxes.size == 0:
+        return bboxes
+    if bboxes.dtype != np.float64:
+        bboxes = bboxes.astype(np.float64)
+    return scale_bboxes_kernel(
+        np.ascontiguousarray(bboxes), float(scale_x), float(scale_y)
+    )
 
 
 def crop_mask(masks: np.ndarray, boxes: np.ndarray) -> np.ndarray:
     """
     "Crop" predicted masks by zeroing out everything not in the predicted bbox.
-    Vectorized by Chong (thanks Chong).
 
     Args:
-        - masks should be a size [h, w, n] tensor of masks
-        - boxes should be a size [n, 4] tensor of bbox coords in relative point form
+        - masks should be a size [n, h, w] tensor of masks
+        - boxes should be a size [n, 4] tensor of bbox coords in (x1, y1, x2, y2)
     """
-
-    n, h, w = masks.shape
-    x1, y1, x2, y2 = np.split(boxes[:, :, None], 4, 1)  # x1 shape(1,1,n)
-    r = np.arange(w, dtype=x1.dtype)[None, None, :]  # rows shape(1,w,1)
-    c = np.arange(h, dtype=x1.dtype)[None, :, None]  # cols shape(h,1,1)
-
-    masks = masks * ((r >= x1) * (r < x2) * (c >= y1) * (c < y2))
-    return masks
+    if masks.size == 0:
+        return masks
+    masks_c = np.ascontiguousarray(masks)
+    boxes_f = boxes if boxes.dtype == np.float64 else boxes.astype(np.float64)
+    return crop_mask_kernel(masks_c, np.ascontiguousarray(boxes_f))
 
 
 def post_process_polygons(
@@ -629,12 +642,15 @@ def stretch_keypoints(
     infer_shape: Tuple[int, int],
     origin_shape: Tuple[int, int],
 ) -> np.ndarray:
+    if keypoints.size == 0:
+        return keypoints
     scale_width = origin_shape[1] / infer_shape[1]
     scale_height = origin_shape[0] / infer_shape[0]
-    for keypoint_id in range(keypoints.shape[1] // 3):
-        keypoints[:, keypoint_id * 3] *= scale_width
-        keypoints[:, keypoint_id * 3 + 1] *= scale_height
-    return keypoints
+    if keypoints.dtype != np.float64:
+        keypoints = keypoints.astype(np.float64)
+    return scale_keypoints_kernel(
+        np.ascontiguousarray(keypoints), float(scale_width), float(scale_height)
+    )
 
 
 def undo_image_padding_for_predicted_keypoints(
@@ -643,32 +659,37 @@ def undo_image_padding_for_predicted_keypoints(
     origin_shape: Tuple[int, int],
 ) -> np.ndarray:
     # Undo scaling and padding from letterbox resize preproc operation
+    if keypoints.size == 0:
+        return keypoints
     scale = min(infer_shape[0] / origin_shape[0], infer_shape[1] / origin_shape[1])
     inter_w = int(origin_shape[1] * scale)
     inter_h = int(origin_shape[0] * scale)
 
     pad_x = (infer_shape[1] - inter_w) / 2
     pad_y = (infer_shape[0] - inter_h) / 2
-    for coord_id in range(keypoints.shape[1] // 3):
-        keypoints[:, coord_id * 3] -= pad_x
-        keypoints[:, coord_id * 3] /= scale
-        keypoints[:, coord_id * 3 + 1] -= pad_y
-        keypoints[:, coord_id * 3 + 1] /= scale
-    return keypoints
+    if keypoints.dtype != np.float64:
+        keypoints = keypoints.astype(np.float64)
+    return undo_padding_keypoints_kernel(
+        np.ascontiguousarray(keypoints),
+        float(pad_x),
+        float(pad_y),
+        float(scale),
+    )
 
 
 def clip_keypoints_coordinates(
     keypoints: np.ndarray,
     origin_shape: Tuple[int, int],
 ) -> np.ndarray:
-    for keypoint_id in range(keypoints.shape[1] // 3):
-        keypoints[:, keypoint_id * 3] = np.round(
-            np.clip(keypoints[:, keypoint_id * 3], a_min=0, a_max=origin_shape[1])
-        )
-        keypoints[:, keypoint_id * 3 + 1] = np.round(
-            np.clip(keypoints[:, keypoint_id * 3 + 1], a_min=0, a_max=origin_shape[0])
-        )
-    return keypoints
+    if keypoints.size == 0:
+        return keypoints
+    if keypoints.dtype != np.float64:
+        keypoints = keypoints.astype(np.float64)
+    return clip_and_round_keypoints_kernel(
+        np.ascontiguousarray(keypoints),
+        float(origin_shape[1]),
+        float(origin_shape[0]),
+    )
 
 
 def shift_keypoints(
@@ -676,10 +697,13 @@ def shift_keypoints(
     shift_x: Union[int, float],
     shift_y: Union[int, float],
 ) -> np.ndarray:
-    for keypoint_id in range(keypoints.shape[1] // 3):
-        keypoints[:, keypoint_id * 3] += shift_x
-        keypoints[:, keypoint_id * 3 + 1] += shift_y
-    return keypoints
+    if keypoints.size == 0:
+        return keypoints
+    if keypoints.dtype != np.float64:
+        keypoints = keypoints.astype(np.float64)
+    return shift_keypoints_kernel(
+        np.ascontiguousarray(keypoints), float(shift_x), float(shift_y)
+    )
 
 
 def sigmoid(x: Union[float, np.ndarray]) -> Union[float, np.number, np.ndarray]:
@@ -694,4 +718,7 @@ def sigmoid(x: Union[float, np.ndarray]) -> Union[float, np.number, np.ndarray]:
     Returns:
         float or numpy.ndarray: The computed sigmoid value(s).
     """
+    if isinstance(x, np.ndarray) and x.size > 0:
+        buf = np.ascontiguousarray(x if x.dtype == np.float64 else x.astype(np.float64))
+        return sigmoid_inplace(buf)
     return 1 / (1 + np.exp(-x))
