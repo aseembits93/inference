@@ -433,7 +433,21 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             self._pending_flush_meta_prev = preprocess_return_metadata
             # Return empty responses for the first frame so the stream
             # pipeline has something to dispatch. The real frame-0 output
-            # arrives one frame later.
+            # arrives one frame later. Use the same response class the
+            # downstream consumer is expecting (dataclass twin for the
+            # workflow fast path, pydantic otherwise) so isinstance
+            # dispatch in the v3 block picks the right decoder.
+            if kwargs.get("source") == "workflow-execution":
+                return [
+                    InstanceSegmentationInferenceResponseDC(
+                        predictions=[],
+                        image=InferenceResponseImageDC(
+                            width=m.original_size.width,
+                            height=m.original_size.height,
+                        ),
+                    )
+                    for m in preprocess_return_metadata
+                ]
             return [
                 InstanceSegmentationInferenceResponse(
                     predictions=[],
