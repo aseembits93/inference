@@ -103,25 +103,6 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
     preprocess_means = [0.485, 0.456, 0.406]
     preprocess_stds = [0.229, 0.224, 0.225]
 
-    _preproc_cache_initialized: bool = False
-
-    def _ensure_preproc_cache(self, device) -> None:
-        if self._preproc_cache_initialized:
-            return
-        means = torch.tensor(self.preprocess_means, device=device, dtype=torch.float32)
-        stds = torch.tensor(self.preprocess_stds, device=device, dtype=torch.float32)
-        self._preproc_scale_gpu = (1.0 / (255.0 * stds)).view(1, 3, 1, 1).contiguous()
-        self._preproc_offset_gpu = (-means / stds).view(1, 3, 1, 1).contiguous()
-        self._input_buffer = torch.empty(
-            (1, 3, self.img_size_h, self.img_size_w),
-            dtype=torch.float32,
-            device=device,
-        )
-        self._preproc_bgr2rgb_idx = torch.tensor(
-            [2, 1, 0], device=device, dtype=torch.long
-        )
-        self._preproc_cache_initialized = True
-
     @property
     def weights_file(self) -> str:
         """Gets the weights file for the RFDETR model.
@@ -224,12 +205,15 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
             )
             preprocessed_image = preprocessed_image.float()
 
-            self._ensure_preproc_cache(preprocessed_image.device)
-            preprocessed_image = torch.addcmul(
-                self._preproc_offset_gpu,
-                preprocessed_image,
-                self._preproc_scale_gpu,
-            )
+            preprocessed_image /= 255.0
+
+            means = torch.tensor(
+                self.preprocess_means, device=preprocessed_image.device
+            ).view(3, 1, 1)
+            stds = torch.tensor(
+                self.preprocess_stds, device=preprocessed_image.device
+            ).view(3, 1, 1)
+            preprocessed_image = (preprocessed_image - means) / stds
         else:
             preprocessed_image = preprocessed_image.astype(np.float32)
             preprocessed_image /= 255.0
@@ -310,22 +294,14 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
             if isinstance(resized, np.ndarray):
                 resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
             else:
-                resized = resized.index_select(1, self._preproc_bgr2rgb_idx)
+                resized = resized[:, [2, 1, 0], :, :]
 
         if isinstance(resized, np.ndarray):
             img_in = np.transpose(resized, (2, 0, 1))
             img_in = img_in.astype(np.float32)
             img_in = np.expand_dims(img_in, axis=0)
         elif USE_PYTORCH_FOR_PREPROCESSING:
-            if (
-                not self.batching_enabled
-                and self._preproc_cache_initialized
-                and resized.shape == self._input_buffer.shape
-            ):
-                self._input_buffer.copy_(resized, non_blocking=True)
-                img_in = self._input_buffer
-            else:
-                img_in = resized
+            img_in = resized.float()
         else:
             raise ValueError(
                 f"Received an image of unknown type, {type(resized)}; "

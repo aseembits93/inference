@@ -11,22 +11,18 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 # Cache of pinned host buffers for async DtoH, keyed by (name, dtype).
-# Pinned memory lets torch's copy_(non_blocking=True) actually run async.
-# We grow on first use and reuse thereafter; buffer is sliced to the
-# current n_survivors for each copy.
-_PINNED_HOST_BUFFERS: dict = {}
+PINNED_HOST_BUFFERS: dict = {}
 
 
-def _get_pinned_buffer(name: str, shape, dtype: torch.dtype) -> torch.Tensor:
-    shape = tuple(int(s) for s in shape)
+def get_pinned_buffer(name: str, shape, dtype: torch.dtype) -> torch.Tensor:
     key = (name, dtype)
-    buf = _PINNED_HOST_BUFFERS.get(key)
+    buf = PINNED_HOST_BUFFERS.get(key)
     if buf is not None:
         # Reuse if the cached buffer is at least as large in every dim.
         if all(buf.shape[i] >= shape[i] for i in range(len(shape))):
             return buf[tuple(slice(0, s) for s in shape)]
     buf = torch.empty(shape, dtype=dtype, pin_memory=True)
-    _PINNED_HOST_BUFFERS[key] = buf
+    PINNED_HOST_BUFFERS[key] = buf
     return buf
 
 from inference.core.entities.requests import (
@@ -374,7 +370,7 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                 stream = torch.cuda.current_stream(device)
                 done_event.wait(stream)
 
-                counter_host = _get_pinned_buffer("counter", (1,), torch.int32)
+                counter_host = get_pinned_buffer("counter", (1,), torch.int32)
                 counter_host.copy_(counter_gpu, non_blocking=True)
                 stream.synchronize()
                 n_survivors = int(counter_host[0].item())
@@ -388,10 +384,10 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                     mask_gpu = det.mask
                     combined_slice = combined_gpu[:n_survivors]
                     mask_slice = mask_gpu[:n_survivors]
-                    combined_host = _get_pinned_buffer(
+                    combined_host = get_pinned_buffer(
                         "combined", combined_slice.shape, combined_slice.dtype
                     )
-                    mask_host = _get_pinned_buffer(
+                    mask_host = get_pinned_buffer(
                         "mask", mask_slice.shape, mask_slice.dtype
                     )
                     combined_host.copy_(combined_slice, non_blocking=True)
