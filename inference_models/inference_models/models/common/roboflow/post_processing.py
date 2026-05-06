@@ -381,17 +381,18 @@ def align_instance_segmentation_results(
         )
         return image_bboxes, empty_masks
     pad_left, pad_top, pad_right, pad_bottom = padding
+    #why do it again, padding has that exactly?
     offsets = torch.tensor(
         [pad_left, pad_top, pad_left, pad_top],
         device=image_bboxes.device,
     )
-    image_bboxes[:, :4].sub_(offsets)
+    image_bboxes[:, :4].sub_(offsets) # no need to index
     scale = torch.as_tensor(
         [scale_width, scale_height, scale_width, scale_height],
         dtype=image_bboxes.dtype,
         device=image_bboxes.device,
     )
-    image_bboxes[:, :4].div_(scale)
+    image_bboxes[:, :4].div_(scale) #no need to index
     n, mh, mw = masks.shape
     mask_h_scale = mh / inference_size.height
     mask_w_scale = mw / inference_size.width
@@ -435,9 +436,9 @@ def align_instance_segmentation_results(
         functional.resize(
             masks,
             [size_after_pre_processing.height, size_after_pre_processing.width],
-            interpolation=functional.InterpolationMode.BILINEAR,
+            interpolation=functional.InterpolationMode.BILINEAR, # why not opencv?
         )
-        .gt_(binarization_threshold)
+        .gt_(binarization_threshold) # why is it 0?
         .to(dtype=torch.bool)
     )
     if static_crop_offset.offset_x > 0 or static_crop_offset.offset_y > 0:

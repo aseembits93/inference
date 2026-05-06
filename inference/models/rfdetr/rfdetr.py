@@ -1,3 +1,5 @@
+import ipdb as pdb
+
 import os
 import time
 from time import perf_counter
@@ -103,6 +105,7 @@ class RFDETRObjectDetection(ObjectDetectionBaseOnnxRoboflowInferenceModel):
         Returns:
             Tuple[np.ndarray, Tuple[int, int]]: A tuple containing a numpy array of the preprocessed image pixel data and a tuple of the images original size.
         """
+        pdb.set_trace()
         if isinstance(image, Image.Image) and USE_PYTORCH_FOR_PREPROCESSING:
             if CUDA_IS_AVAILABLE:
                 np_image = torch.from_numpy(np.asarray(image, copy=False)).cuda()

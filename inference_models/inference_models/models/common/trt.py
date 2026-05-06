@@ -1,3 +1,5 @@
+import ipdb as pdb
+
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -684,6 +686,7 @@ def _execute_trt_engine(
     outputs: List[str],
     trt_cuda_graph_cache: Optional[TRTCudaGraphCache] = None,
 ) -> List[torch.Tensor]:
+    pdb.set_trace()
     if trt_cuda_graph_cache is not None:
         input_shape = tuple(pre_processed_images.shape)
         input_dtype = pre_processed_images.dtype

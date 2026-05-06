@@ -1,3 +1,5 @@
+import ipdb as pdb
+
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -42,6 +44,7 @@ def pre_process_network_input(
     intermediate size, then bilinear-interpolate to the square training size.
     This matches the two-step resize the Roboflow training pipeline applies.
     """
+    pdb.set_trace()
     two_step = _needs_nonsquare_two_step_resize(network_input)
     effective_network_input = network_input
     if two_step:

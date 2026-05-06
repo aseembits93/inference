@@ -1,6 +1,6 @@
 import math
 from typing import List, Optional, Tuple, Union
-
+import ipdb as pdb
 import cv2
 import numpy as np
 import PIL
@@ -1046,10 +1046,12 @@ def handle_numpy_input_preparation_with_stretch(
     target_size: ImageDimensions,
     static_crop_offset: StaticCropOffset,
 ) -> Tuple[torch.Tensor, List[PreProcessingMetadata]]:
+    pdb.set_trace()
     size_after_pre_processing = ImageDimensions(
         height=image.shape[0], width=image.shape[1]
     )
     resized_image = cv2.resize(image, (target_size.width, target_size.height))
+    #gpu from now on
     tensor = torch.from_numpy(resized_image).to(device=target_device)
     tensor = torch.unsqueeze(tensor, 0)
     tensor = tensor.permute(0, 3, 1, 2)

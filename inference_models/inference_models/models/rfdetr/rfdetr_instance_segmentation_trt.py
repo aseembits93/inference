@@ -1,6 +1,8 @@
 import threading
 from typing import List, Optional, Set, Tuple, Union
 
+import ipdb as pdb
+
 import numpy as np
 import torch
 
@@ -256,6 +258,7 @@ class RFDetrForInstanceSegmentationTRT(
         disable_cuda_graphs: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        #pdb.set_trace()
         cache = self._trt_cuda_graph_cache if not disable_cuda_graphs else None
         with self._lock:
             with use_cuda_context(context=self._cuda_context):

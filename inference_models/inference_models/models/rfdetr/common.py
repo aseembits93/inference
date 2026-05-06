@@ -1,3 +1,5 @@
+import ipdb as pdb
+
 import os
 from typing import List, Optional, Tuple, Union
 
@@ -90,6 +92,7 @@ def post_process_instance_segmentation_results(
     num_classes: int,
     classes_re_mapping: Optional[ClassesReMapping],
 ) -> List[InstanceDetections]:
+    pdb.set_trace()
     if _fullpost_eligible(bboxes, pre_processing_meta, classes_re_mapping):
         meta = pre_processing_meta[0]
         thr_arg = threshold if isinstance(threshold, torch.Tensor) else float(threshold)
@@ -115,6 +118,7 @@ def post_process_instance_segmentation_results(
         detections.__dict__["_counter_gpu"] = counter
         detections.__dict__["_postproc_done_event"] = done_event
         return [detections]
+    #pdb.set_trace()
     logits_sigmoid = torch.nn.functional.sigmoid(logits)
     results = []
     device = bboxes.device

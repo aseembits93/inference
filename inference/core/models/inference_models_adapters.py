@@ -3,7 +3,7 @@ import io
 from io import BytesIO
 from time import perf_counter
 from typing import Any, List, Optional, Tuple, Union
-
+import ipdb as pdb
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -293,7 +293,10 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             disable_static_crop=kwargs.get("disable_preproc_static_crop", False),
         )
         kwargs["pre_processing_overrides"] = pre_processing_overrides
-        if "rle" in self._model.supported_mask_formats:
+        if (
+            "rle" in self._model.supported_mask_formats
+            and kwargs.get("response_mask_format") == "rle"
+        ):
             kwargs["mask_format"] = "rle"
         return kwargs
 
@@ -322,6 +325,7 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         preprocess_return_metadata: PreprocessingMetadata,
         **kwargs,
     ) -> List[InstanceSegmentationInferenceResponse]:
+        #pdb.set_trace()
         return_in_rle = kwargs.get("response_mask_format") == "rle"
         mapped_kwargs = self.map_inference_kwargs(kwargs)
         detections_list = self._model.post_process(
@@ -375,11 +379,18 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                     mask_host.copy_(mask_slice, non_blocking=True)
                     stream.synchronize()
                     combined_cpu = combined_host.numpy()
-                    xyxy = combined_cpu[:, :4]
                     # combined[:, 4] holds fp32 conf bits stored as int32.
                     confs = combined_cpu[:, 4].view(np.float32)
-                    class_ids = combined_cpu[:, 5]
-                    polys_or_rles = masks2poly(mask_host.numpy())
+                    # Triton filter packs survivors in atomic_add order;
+                    # re-sort descending to match the non-fast path. Reorder
+                    # the poly list rather than fancy-indexing the mask buffer
+                    # to avoid an (n, H, W) uint8 memcpy.
+                    polys_unsorted = masks2poly(mask_host.numpy())
+                    order = np.argsort(-confs, kind="stable")
+                    xyxy = combined_cpu[order, :4]
+                    confs = confs[order]
+                    class_ids = combined_cpu[order, 5]
+                    polys_or_rles = [polys_unsorted[i] for i in order]
             else:
                 xyxy = det.xyxy.detach().cpu().numpy()
                 confs = det.confidence.detach().cpu().numpy()
@@ -453,7 +464,7 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                             class_id=class_id_int,
                         )
                     )
-
+            pdb.set_trace()
             responses.append(
                 InstanceSegmentationInferenceResponse(
                     predictions=predictions,
