@@ -1,11 +1,11 @@
 """Drives the COCO preproc-only study end-to-end.
 
 1. Runs coco_preproc_only_dump.py once per selected preproc (default:
-   ref + cv2 + triton).
+   cv2 + ref + triton; cv2 is the production reference).
 2. Diffs per-image detection digests with greedy IoU pairing for each
-   pair of runs involving triton (triton-vs-ref and triton-vs-cv2).
+   pair of runs involving triton (triton-vs-cv2 and triton-vs-ref).
 3. Computes pycocotools bbox + segm mAP for every run and prints a
-   side-by-side table with deltas vs the F.interpolate reference.
+   side-by-side table with deltas vs the cv2.resize production baseline.
 """
 import argparse
 import json
@@ -206,11 +206,12 @@ def main() -> int:
     ap.add_argument("--diff_only", action="store_true")
     ap.add_argument(
         "--preprocs",
-        default="ref,cv2,triton",
+        default="cv2,ref,triton",
         help="comma list of preproc variants to run/diff "
              "(subset of ref,cv2,triton). The 'triton' run is the "
              "subject under test; diffs are produced for each other "
-             "variant vs triton.",
+             "variant vs triton. Default order puts cv2 first so it "
+             "reads as the baseline in the mAP table.",
     )
     args = ap.parse_args()
 
@@ -259,9 +260,11 @@ def main() -> int:
         for v in variants
     }
 
-    # Pick the baseline for the delta column: 'ref' if present, else the
-    # first non-triton variant, else triton itself (degenerate but valid).
-    baseline = "ref" if "ref" in maps else next(
+    # cv2.resize is the production preproc path; treat it as the
+    # mAP baseline so the delta column answers "does triton regress
+    # the deployed behavior?". Fall back to the first non-triton
+    # variant (or triton itself) if cv2 wasn't run.
+    baseline = "cv2" if "cv2" in maps else next(
         (v for v in variants if v != "triton"), "triton")
 
     print("\n==================== SIDE-BY-SIDE ====================")
