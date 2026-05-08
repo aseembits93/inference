@@ -33,12 +33,12 @@ if TRITON_AVAILABLE:
         target_w,
         scale_y,
         scale_x,
-        inv_std_r_255,
-        inv_std_g_255,
-        inv_std_b_255,
-        offset_r,
-        offset_g,
-        offset_b,
+        mean_r,
+        mean_g,
+        mean_b,
+        std_r,
+        std_g,
+        std_b,
         dst_stride_c,
         dst_stride_h,
         BLOCK_H: tl.constexpr,
@@ -50,9 +50,13 @@ if TRITON_AVAILABLE:
         Dst: fp32 (1, 3, target_h, target_w) CHW RGB, normalized to
         (pixel / 255 - mean) / std.
 
-        We pre-fold the division: inv_std_c_255 = 1 / (255 * std_c), and
-        pre-fold the subtraction: offset_c = -mean_c / std_c (done on host).
-        So the per-pixel math becomes: pixel * inv_std_c_255 + offset_c.
+        Arithmetic order matches the PyTorch reference exactly:
+            fp32(pixel) -> bilinear -> /255 -> -mean -> /std
+        so fp32 output is bit-equal to
+            F.interpolate(t.float()) / 255  -> (x - mean) / std.
+        The `inv_std_c_255 + offset` fusion used earlier was off by
+        1 ULP in the last place; fp16 engines can round those ULPs to
+        different values and flip downstream top-1 decisions.
         """
         pid_y = tl.program_id(0)
         pid_x = tl.program_id(1)
@@ -63,7 +67,7 @@ if TRITON_AVAILABLE:
         mask_x = offs_x < target_w
         mask = mask_y[:, None] & mask_x[None, :]
 
-        # Pixel-center bilinear sampling for parity with cv2.resize.
+        # Pixel-center bilinear sampling (align_corners=False).
         src_y_f = (offs_y.to(tl.float32) + 0.5) * scale_y - 0.5
         src_x_f = (offs_x.to(tl.float32) + 0.5) * scale_x - 0.5
 
@@ -112,11 +116,11 @@ if TRITON_AVAILABLE:
         p11_r = tl.load(src_ptr + base_11 + 2, mask=mask, other=0).to(tl.float32)
         r_val = p00_r * w_tl + p01_r * w_tr + p10_r * w_bl + p11_r * w_br
 
-        # Math: (pixel/255 - mean) / std  ==  pixel * (1/(255*std)) + (-mean/std).
-        # inv_std_c_255 and offset_c are computed on the host and passed in.
-        r_out = r_val * inv_std_r_255 + offset_r
-        g_out = g_val * inv_std_g_255 + offset_g
-        b_out = b_val * inv_std_b_255 + offset_b
+        # Match PyTorch's `(x / 255 - mean) / std` op order exactly.
+        inv_255 = 1.0 / 255.0
+        r_out = (r_val * inv_255 - mean_r) / std_r
+        g_out = (g_val * inv_255 - mean_g) / std_g
+        b_out = (b_val * inv_255 - mean_b) / std_b
 
         out_row_offsets = offs_y[:, None] * dst_stride_h + offs_x[None, :]
         tl.store(dst_ptr + 0 * dst_stride_c + out_row_offsets, r_out, mask=mask)
@@ -166,13 +170,6 @@ def triton_preprocess_rfdetr_stretch(
     dst_stride_c = target_h * target_w
     dst_stride_h = target_w
 
-    inv_std_r_255 = 1.0 / (255.0 * stds[0])
-    inv_std_g_255 = 1.0 / (255.0 * stds[1])
-    inv_std_b_255 = 1.0 / (255.0 * stds[2])
-    offset_r = -means[0] / stds[0]
-    offset_g = -means[1] / stds[1]
-    offset_b = -means[2] / stds[2]
-
     BLOCK_H = 16
     BLOCK_W = 16
     grid = (
@@ -190,12 +187,12 @@ def triton_preprocess_rfdetr_stretch(
         target_w,
         float(scale_y),
         float(scale_x),
-        float(inv_std_r_255),
-        float(inv_std_g_255),
-        float(inv_std_b_255),
-        float(offset_r),
-        float(offset_g),
-        float(offset_b),
+        float(means[0]),
+        float(means[1]),
+        float(means[2]),
+        float(stds[0]),
+        float(stds[1]),
+        float(stds[2]),
         dst_stride_c,
         dst_stride_h,
         BLOCK_H=BLOCK_H,
