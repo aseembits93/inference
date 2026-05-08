@@ -1,8 +1,14 @@
 """Run rfdetr-seg-nano over COCO val2017 with isolated preproc.
 
-Preproc function is either:
+Preproc function is one of:
   --preproc ref    : cast uint8 BGR -> float -> F.interpolate -> BGR->RGB
                      -> /255 -> (x - mean) / std
+                     (mirrors the torch.Tensor-input adapter path,
+                     i.e. legacy USE_PYTORCH_FOR_PREPROCESSING=true)
+  --preproc cv2    : cv2.resize (INTER_LINEAR, CPU fp32) -> BGR->RGB ->
+                     /255 -> (x - mean) / std
+                     (mirrors the numpy-input adapter path, i.e. the
+                     production route Triton replaces)
   --preproc triton : triton_preprocess_rfdetr_stretch (fused kernel)
 
 forward() and post_process() are identical across runs. Emits two
@@ -78,6 +84,23 @@ def preproc_ref(frame_bgr: np.ndarray, target_h: int, target_w: int,
     return t.contiguous()
 
 
+def preproc_cv2(frame_bgr: np.ndarray, target_h: int, target_w: int,
+                means, stds) -> torch.Tensor:
+    # cv2.resize: (W, H) order; INTER_LINEAR matches the numpy-input
+    # adapter path. cv2 does the bilinear pass on CPU in fp32, then we
+    # ship the resized image to GPU and finish normalization there.
+    resized = cv2.resize(frame_bgr, (target_w, target_h),
+                         interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    t = torch.from_numpy(rgb).cuda()
+    t = t.permute(2, 0, 1).contiguous().unsqueeze(0).float()
+    t = t / 255.0
+    mean = torch.tensor(means, device=t.device).view(1, 3, 1, 1)
+    std = torch.tensor(stds, device=t.device).view(1, 3, 1, 1)
+    t = (t - mean) / std
+    return t.contiguous()
+
+
 def preproc_triton(frame_bgr: np.ndarray, target_h: int, target_w: int,
                    means, stds) -> torch.Tensor:
     src = torch.from_numpy(frame_bgr).cuda()
@@ -102,7 +125,8 @@ def main() -> None:
                     help="low threshold so COCO eval sees the full PR curve")
     ap.add_argument("--dump_prefix", required=True,
                     help="paths <prefix>.jsonl and <prefix>.json are written")
-    ap.add_argument("--preproc", choices=("ref", "triton"), required=True)
+    ap.add_argument("--preproc", choices=("ref", "cv2", "triton"),
+                    required=True)
     ap.add_argument("--max_images", type=int, default=0)
     args = ap.parse_args()
 
@@ -121,7 +145,11 @@ def main() -> None:
     target_w = ni.training_input_size.width
     means, stds = ni.normalization
 
-    preproc_fn = preproc_ref if args.preproc == "ref" else preproc_triton
+    preproc_fn = {
+        "ref": preproc_ref,
+        "cv2": preproc_cv2,
+        "triton": preproc_triton,
+    }[args.preproc]
 
     coco_dets = []
     jsonl_path = args.dump_prefix + ".jsonl"

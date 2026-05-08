@@ -1,10 +1,14 @@
 """Probe the preprocessed tensor produced by the Triton kernel vs
-the F.interpolate reference path, pixel-by-pixel.
+two reference paths, pixel-by-pixel:
 
-Loads one frame, runs both preprocessors, and prints:
-  - max abs diff
-  - count of mismatched fp32 elements
-  - first mismatch location + value pair
+  - F.interpolate : mirrors the tensor-input adapter path (used as the
+                    correctness reference throughout this PR).
+  - cv2.resize    : mirrors the numpy-input adapter path (the legacy
+                    production route that Triton is replacing).
+
+For each reference, prints max/mean abs diff, count of mismatched fp32
+elements, per-channel stats, and the first mismatch. Both references
+are measured against the Triton output on the same frame.
 """
 import argparse
 import os
@@ -36,6 +40,47 @@ def pytorch_reference(frame_bgr: np.ndarray, target_h: int, target_w: int,
     return t.contiguous()
 
 
+def cv2_reference(frame_bgr: np.ndarray, target_h: int, target_w: int,
+                  means, stds) -> torch.Tensor:
+    """Mirror the numpy-input adapter path: cv2.resize (INTER_LINEAR) +
+    BGR->RGB + /255 + (x - mean) / std. cv2 runs on CPU in fp32 so this
+    is what the production numpy route computes, not F.interpolate."""
+    # cv2.resize takes (W, H); INTER_LINEAR is the adapter's default.
+    resized = cv2.resize(frame_bgr, (target_w, target_h),
+                         interpolation=cv2.INTER_LINEAR)
+    # HWC BGR uint8 -> CHW RGB fp32.
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    t = torch.from_numpy(rgb).cuda()
+    t = t.permute(2, 0, 1).contiguous().unsqueeze(0).float()
+    t = t / 255.0
+    mean = torch.tensor(means, device=t.device).view(1, 3, 1, 1)
+    std = torch.tensor(stds, device=t.device).view(1, 3, 1, 1)
+    t = (t - mean) / std
+    return t.contiguous()
+
+
+def _report(name: str, ref: torch.Tensor, other: torch.Tensor) -> None:
+    diff = (ref - other).abs()
+    print(f"\n[{name}] ref shape {tuple(ref.shape)} dtype {ref.dtype}")
+    print(f"  max abs diff   : {diff.max().item():.3e}")
+    print(f"  mean abs diff  : {diff.mean().item():.3e}")
+    n_mm = (diff > 0).sum().item()
+    print(f"  n mismatched   : {n_mm}/{diff.numel()} "
+          f"({100.0 * n_mm / diff.numel():.2f}%)")
+    for c, ch in enumerate(("R", "G", "B")):
+        d = diff[0, c]
+        print(f"    ch {ch}: max {d.max().item():.3e} "
+              f"mean {d.mean().item():.3e} "
+              f"n>0 {(d>0).sum().item()}/{d.numel()}")
+    flat = diff.flatten()
+    idx = (flat > 0).nonzero()
+    if idx.numel():
+        k = idx[0].item()
+        print(f"  first mismatch flat_idx={k} "
+              f"ref={ref.flatten()[k].item():.10f} "
+              f"other={other.flatten()[k].item():.10f}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--video_reference", required=True)
@@ -55,7 +100,9 @@ def main() -> None:
     means = (0.485, 0.456, 0.406)
     stds = (0.229, 0.224, 0.225)
 
-    ref = pytorch_reference(frame, args.target_h, args.target_w, means, stds)
+    ref_interp = pytorch_reference(frame, args.target_h, args.target_w,
+                                   means, stds)
+    ref_cv2 = cv2_reference(frame, args.target_h, args.target_w, means, stds)
 
     from inference_models.models.rfdetr.triton_preprocess import (
         triton_preprocess_rfdetr_stretch,
@@ -70,25 +117,10 @@ def main() -> None:
         stds=stds,
     )
 
-    diff = (ref - tri).abs()
-    print(f"ref shape {tuple(ref.shape)} dtype {ref.dtype}")
     print(f"tri shape {tuple(tri.shape)} dtype {tri.dtype}")
-    print(f"max abs diff   : {diff.max().item():.3e}")
-    print(f"mean abs diff  : {diff.mean().item():.3e}")
-    print(f"n mismatched   : {(diff > 0).sum().item()}/{diff.numel()} "
-          f"({100.0 * (diff > 0).sum().item() / diff.numel():.2f}%)")
-    # Per-channel stats
-    for c, name in enumerate(("R", "G", "B")):
-        d = diff[0, c]
-        print(f"  ch {name}: max {d.max().item():.3e} mean {d.mean().item():.3e} "
-              f"n>0 {(d>0).sum().item()}/{d.numel()}")
-    # First mismatch
-    flat = diff.flatten()
-    idx = (flat > 0).nonzero()
-    if idx.numel():
-        k = idx[0].item()
-        print(f"first mismatch flat_idx={k} ref={ref.flatten()[k].item():.10f} "
-              f"tri={tri.flatten()[k].item():.10f}")
+    _report("triton vs F.interpolate", ref_interp, tri)
+    _report("triton vs cv2.resize", ref_cv2, tri)
+    _report("F.interpolate vs cv2.resize", ref_interp, ref_cv2)
 
 
 if __name__ == "__main__":

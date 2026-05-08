@@ -1,8 +1,11 @@
 """Drives the COCO preproc-only study end-to-end.
 
-1. Runs coco_preproc_only_dump.py twice (ref / triton).
-2. Diffs the per-image detection digests with greedy IoU pairing.
-3. Computes pycocotools bbox + segm mAP for each run and prints both.
+1. Runs coco_preproc_only_dump.py once per selected preproc (default:
+   ref + cv2 + triton).
+2. Diffs per-image detection digests with greedy IoU pairing for each
+   pair of runs involving triton (triton-vs-ref and triton-vs-cv2).
+3. Computes pycocotools bbox + segm mAP for every run and prints a
+   side-by-side table with deltas vs the F.interpolate reference.
 """
 import argparse
 import json
@@ -81,7 +84,8 @@ def load_jsonl(path: str) -> list[dict]:
 
 
 def diff_detection_dumps(a_path: str, b_path: str, conf_tol: float,
-                         iou_tol: float, diff_conf_threshold: float) -> None:
+                         iou_tol: float, diff_conf_threshold: float,
+                         label: str = "") -> None:
     """The dumps include dets down to confidence 0.05 (for COCO mAP), but
     the detection diff only makes sense at a realistic threshold — the
     0.05..0.4 tail is dominated by degenerate boxes that pair arbitrarily
@@ -131,7 +135,9 @@ def diff_detection_dumps(a_path: str, b_path: str, conf_tol: float,
         arr.sort()
         return arr[int(len(arr) * q)] if arr else 0.0
 
-    print("\n==================== DETECTION DIFF ====================")
+    header = "DETECTION DIFF" if not label else f"DETECTION DIFF [{label}]"
+    print(f"\n==================== {header} ====================")
+    print(f"a / b                 : {a_path}  vs  {b_path}")
     print(f"images                : {len(A)}")
     print(f"filter conf >=        : {diff_conf_threshold}")
     print(f"images fully clean    : {frames_clean}")
@@ -198,42 +204,84 @@ def main() -> int:
                     help="min conf for a detection to enter the diff pass")
     ap.add_argument("--dump_dir", default=str(REPO))
     ap.add_argument("--diff_only", action="store_true")
+    ap.add_argument(
+        "--preprocs",
+        default="ref,cv2,triton",
+        help="comma list of preproc variants to run/diff "
+             "(subset of ref,cv2,triton). The 'triton' run is the "
+             "subject under test; diffs are produced for each other "
+             "variant vs triton.",
+    )
     args = ap.parse_args()
 
+    variants = [v.strip() for v in args.preprocs.split(",") if v.strip()]
+    valid = {"ref", "cv2", "triton"}
+    bad = [v for v in variants if v not in valid]
+    if bad:
+        print(f"FATAL: unknown preproc(s) {bad}; valid={sorted(valid)}",
+              file=sys.stderr)
+        return 2
+    if "triton" not in variants:
+        print("FATAL: --preprocs must include 'triton' (the subject "
+              "under test)", file=sys.stderr)
+        return 2
+
     dump_dir = Path(args.dump_dir)
-    ref_prefix = str(dump_dir / "coco_preproc_ref")
-    tri_prefix = str(dump_dir / "coco_preproc_triton")
+    prefixes = {v: str(dump_dir / f"coco_preproc_{v}") for v in variants}
 
     if not args.diff_only:
         t0 = time.time()
-        rc = run_dump("ref", args.images_dir, args.annotations_json,
-                      args.model_id, args.confidence, ref_prefix,
-                      args.max_images, args.timeout)
-        if rc != 0:
-            print(f"FATAL: ref exit {rc}", file=sys.stderr)
-            return 3
-        rc = run_dump("triton", args.images_dir, args.annotations_json,
-                      args.model_id, args.confidence, tri_prefix,
-                      args.max_images, args.timeout)
-        if rc != 0:
-            print(f"FATAL: triton exit {rc}", file=sys.stderr)
-            return 3
-        print(f"[bench] both dumps: {time.time()-t0:.1f}s", flush=True)
+        for v in variants:
+            rc = run_dump(v, args.images_dir, args.annotations_json,
+                          args.model_id, args.confidence, prefixes[v],
+                          args.max_images, args.timeout)
+            if rc != 0:
+                print(f"FATAL: {v} exit {rc}", file=sys.stderr)
+                return 3
+        print(f"[bench] {len(variants)} dumps: {time.time()-t0:.1f}s",
+              flush=True)
 
-    diff_detection_dumps(ref_prefix + ".jsonl", tri_prefix + ".jsonl",
-                         args.conf_tol, args.iou_tol,
-                         args.diff_conf_threshold)
+    # Diff every non-triton variant against triton. Pairings are directed
+    # (a=reference, b=triton) so "unmatched A" means dets present only in
+    # the reference path.
+    for v in variants:
+        if v == "triton":
+            continue
+        diff_detection_dumps(
+            prefixes[v] + ".jsonl", prefixes["triton"] + ".jsonl",
+            args.conf_tol, args.iou_tol, args.diff_conf_threshold,
+            label=f"{v} vs triton",
+        )
 
-    ref_map = coco_eval(ref_prefix + ".json", args.annotations_json, "ref")
-    tri_map = coco_eval(tri_prefix + ".json", args.annotations_json, "triton")
+    # mAP for every variant.
+    maps = {
+        v: coco_eval(prefixes[v] + ".json", args.annotations_json, v)
+        for v in variants
+    }
+
+    # Pick the baseline for the delta column: 'ref' if present, else the
+    # first non-triton variant, else triton itself (degenerate but valid).
+    baseline = "ref" if "ref" in maps else next(
+        (v for v in variants if v != "triton"), "triton")
 
     print("\n==================== SIDE-BY-SIDE ====================")
-    print(f"{'metric':<20} {'ref':>10} {'triton':>10} {'delta':>10}")
+    header = f"{'metric':<20}"
+    for v in variants:
+        header += f" {v:>10}"
+    for v in variants:
+        if v != baseline:
+            header += f" {('d.'+v[:6]):>10}"
+    print(header)
     for t in ("bbox", "segm"):
         for k in ("AP_50_95", "AP_50", "AP_75", "AP_S", "AP_M", "AP_L"):
-            a = ref_map[t][k]
-            b = tri_map[t][k]
-            print(f"{t+'.'+k:<20} {a:>10.4f} {b:>10.4f} {b-a:>+10.4f}")
+            row = f"{t+'.'+k:<20}"
+            for v in variants:
+                row += f" {maps[v][t][k]:>10.4f}"
+            for v in variants:
+                if v != baseline:
+                    row += f" {maps[v][t][k] - maps[baseline][t][k]:>+10.4f}"
+            print(row)
+    print(f"(delta is <variant> - {baseline})")
     print("======================================================")
     return 0
 
