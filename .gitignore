@@ -1,4 +1,5 @@
 .codex/
+*.mp4
 watch-dev.sh
 cpu_http.py
 .temp/
