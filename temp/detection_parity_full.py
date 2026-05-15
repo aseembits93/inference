@@ -1,12 +1,13 @@
-"""Full coco/val2017 detection + mask parity: Triton fast path vs PIL.
+"""Full coco/val2017 detection + mask parity: fused-postproc Triton path vs reference.
 
-Driven by INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED. Because the env
-var is read once at import time, we run two subprocesses (true, false),
-dump per-image detections to pickle, then compare.
+Driven by RFDETR_TRITON_FULLPOSTPROC (true/false). The env var is read once at
+import time, so we run two subprocesses (fullpost on, fullpost off), stream
+per-image detections to a pickle file (one pickle.dump per record), then
+compare in lockstep.
 
 Usage:
   python temp/detection_parity_full.py           # driver: runs both passes
-  python temp/detection_parity_full.py --mode run --env true  --out /tmp/full_on.pkl
+  python temp/detection_parity_full.py --mode run --out /tmp/full_on.pkl
   python temp/detection_parity_full.py --mode compare --on /tmp/full_on.pkl --off /tmp/full_off.pkl
 """
 import argparse
@@ -23,6 +24,20 @@ PY = sys.executable
 SELF = Path(__file__).resolve()
 OUT_ON = "/tmp/det_parity_full_on.pkl"
 OUT_OFF = "/tmp/det_parity_full_off.pkl"
+# Cap images per pass: fullpost caches a per-(orig_h, orig_w) GPU buffer in
+# _get_mask_bin_buffer, so the working set grows with distinct image sizes and
+# OOMs near ~5k images on a 14 GiB card. 1500 covers a wide variety of shapes
+# while staying well under that ceiling.
+MAX_IMAGES = int(os.environ.get("PARITY_MAX_IMAGES", "1500"))
+
+
+def _iter_records(path):
+    with open(path, "rb") as f:
+        while True:
+            try:
+                yield pickle.load(f)
+            except EOFError:
+                return
 
 
 def do_run(out_path):
@@ -35,45 +50,63 @@ def do_run(out_path):
     import torch
 
     from inference_models import AutoModel
-    import inference_models.models.rfdetr.rfdetr_instance_segmentation_trt as trt_mod
+    import inference_models.models.rfdetr.common as common_mod
 
-    triton_calls = {"count": 0}
-    original = trt_mod.triton_preprocess_rfdetr_stretch
-    if original is not None:
-        def counting(*a, **kw):
-            triton_calls["count"] += 1
-            return original(*a, **kw)
-        trt_mod.triton_preprocess_rfdetr_stretch = counting
+    fullpost_calls = {"count": 0}
+    original_fp = getattr(common_mod, "triton_rfdetr_fullpost", None)
+    if original_fp is not None:
+        def counting_fp(*a, **kw):
+            fullpost_calls["count"] += 1
+            return original_fp(*a, **kw)
+        common_mod.triton_rfdetr_fullpost = counting_fp
 
-    env_flag = os.environ.get("INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED", "<unset>")
-    print(f"[run] env={env_flag}  _FAST_PATH_ENABLED={trt_mod._FAST_PATH_ENABLED}")
+    fp_flag = os.environ.get("RFDETR_TRITON_FULLPOSTPROC", "<unset>")
+    print(
+        f"[run] RFDETR_TRITON_FULLPOSTPROC={fp_flag} "
+        f"(module ready={getattr(common_mod, '_TRITON_FULLPOST_READY', False)})"
+    )
 
-    paths = sorted(COCO.glob("*.jpg"))
+    paths = sorted(COCO.glob("*.jpg"))[:MAX_IMAGES]
     model = AutoModel.from_pretrained("rfdetr-seg-nano")
 
-    records = []
+    n_records = 0
     t0 = time.perf_counter()
-    for idx, p in enumerate(paths):
-        im = cv2.imread(str(p), cv2.IMREAD_COLOR)
-        if im is None:
-            continue
-        pre, meta = model.pre_process(im)
-        out = model.forward(pre)
-        det = model.post_process(out, meta, confidence=CONFIDENCE)[0]
-        n = int(det.class_id.numel())
-        records.append({
-            "path": str(p),
-            "xyxy": det.xyxy.cpu().numpy() if n else None,
-            "conf": det.confidence.cpu().numpy() if n else None,
-            "cls":  det.class_id.cpu().numpy() if n else None,
-            "mask": det.mask.cpu().to(torch.bool).numpy() if (n and det.mask is not None) else None,
-        })
-        if (idx + 1) % 500 == 0:
-            print(f"  [{env_flag}] {idx+1}/{len(paths)}  ({time.perf_counter()-t0:.0f}s)", flush=True)
-
     with open(out_path, "wb") as f:
-        pickle.dump({"records": records, "triton_calls": triton_calls["count"]}, f)
-    print(f"[run] triton_kernel_calls={triton_calls['count']}  saved -> {out_path}")
+        # placeholder header — rewritten at end
+        pickle.dump({"_kind": "header", "fullpost_calls": -1, "n_records": -1}, f)
+        for idx, p in enumerate(paths):
+            im = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            if im is None:
+                continue
+            pre, meta = model.pre_process(im)
+            out = model.forward(pre)
+            det = model.post_process(out, meta, confidence=CONFIDENCE)[0]
+            n = int(det.class_id.numel())
+            if n and det.mask is not None:
+                m_np = det.mask.cpu().to(torch.bool).numpy()
+                packed = np.packbits(m_np.reshape(n, -1), axis=1)
+                mask_shape = m_np.shape[1:]
+            else:
+                packed = None
+                mask_shape = None
+            rec = {
+                "_kind": "rec",
+                "path": str(p),
+                "xyxy": det.xyxy.cpu().numpy() if n else None,
+                "conf": det.confidence.cpu().numpy() if n else None,
+                "cls":  det.class_id.cpu().numpy() if n else None,
+                "mask_packed": packed,
+                "mask_shape": mask_shape,
+            }
+            pickle.dump(rec, f)
+            n_records += 1
+            if (idx + 1) % 500 == 0:
+                print(f"  [fp={fp_flag}] {idx+1}/{len(paths)}  ({time.perf_counter()-t0:.0f}s)", flush=True)
+
+    # append a footer with the totals (header is ignored on read; iterator just walks records + footer)
+    with open(out_path, "ab") as f:
+        pickle.dump({"_kind": "footer", "fullpost_calls": fullpost_calls["count"], "n_records": n_records}, f)
+    print(f"[run] fullpost_kernel_calls={fullpost_calls['count']}  records={n_records}  saved -> {out_path}")
 
 
 def iou_box(a, b):
@@ -87,21 +120,39 @@ def iou_box(a, b):
     return inter / u if u > 0 else 0.0
 
 
+def _unpack_masks(rec):
+    import numpy as np
+    if rec["mask_packed"] is None:
+        return None
+    n = len(rec["mask_packed"])
+    h, w = rec["mask_shape"]
+    flat = np.unpackbits(rec["mask_packed"], axis=1, count=h * w)
+    return flat.reshape(n, h, w).astype(bool)
+
+
 def do_compare(on_path, off_path):
     import numpy as np
-    with open(on_path, "rb") as f:
-        on = pickle.load(f)
-    with open(off_path, "rb") as f:
-        off = pickle.load(f)
-
-    assert len(on["records"]) == len(off["records"])
-    n_imgs = len(on["records"])
 
     tot_on = tot_off = matched = class_disagree = count_mm = pixel_identical = 0
     ious, dscores, mask_iou = [], [], []
+    on_fp_calls = off_fp_calls = -1
+    n_imgs = 0
 
-    for r_on, r_off in zip(on["records"], off["records"]):
-        assert r_on["path"] == r_off["path"]
+    on_iter = _iter_records(on_path)
+    off_iter = _iter_records(off_path)
+
+    for r_on, r_off in zip(on_iter, off_iter):
+        if r_on.get("_kind") == "header":
+            r_on = next(on_iter)
+        if r_off.get("_kind") == "header":
+            r_off = next(off_iter)
+        if r_on.get("_kind") == "footer" or r_off.get("_kind") == "footer":
+            on_fp_calls = r_on.get("fullpost_calls", on_fp_calls)
+            off_fp_calls = r_off.get("fullpost_calls", off_fp_calls)
+            break
+
+        assert r_on["path"] == r_off["path"], (r_on["path"], r_off["path"])
+        n_imgs += 1
         nf = 0 if r_on["xyxy"] is None else len(r_on["xyxy"])
         nr = 0 if r_off["xyxy"] is None else len(r_off["xyxy"])
         tot_on += nf; tot_off += nr
@@ -115,7 +166,8 @@ def do_compare(on_path, off_path):
         sr = r_off["conf"] if nr else np.zeros(0)
         cf = r_on["cls"] if nf else np.zeros(0, dtype=int)
         cr = r_off["cls"] if nr else np.zeros(0, dtype=int)
-        mf, mr_m = r_on["mask"], r_off["mask"]
+        mf = _unpack_masks(r_on) if nf else None
+        mr_m = _unpack_masks(r_off) if nr else None
 
         used = set()
         for j in range(nr):
@@ -141,12 +193,21 @@ def do_compare(on_path, off_path):
                     if np.array_equal(a, b):
                         pixel_identical += 1
 
+    # drain footers if not already pulled
+    for it, current_calls_attr in ((on_iter, "on_fp_calls"), (off_iter, "off_fp_calls")):
+        for r in it:
+            if r.get("_kind") == "footer":
+                if current_calls_attr == "on_fp_calls":
+                    on_fp_calls = r["fullpost_calls"]
+                else:
+                    off_fp_calls = r["fullpost_calls"]
+
     print()
-    print(f"==== full coco/val2017 parity: env=true vs env=false ({n_imgs} images) ====")
-    print(f"  triton calls (env=true)      : {on['triton_calls']}")
-    print(f"  triton calls (env=false)     : {off['triton_calls']}")
-    print(f"  dets env=true / env=false    : {tot_on} / {tot_off}")
-    print(f"  matched (IoU>0.5)            : {matched} ({100*matched/max(1,tot_off):.2f}% of env=false)")
+    print(f"==== full coco/val2017 parity: fullpost=true vs fullpost=false ({n_imgs} images) ====")
+    print(f"  fullpost calls (fp=true)     : {on_fp_calls}")
+    print(f"  fullpost calls (fp=false)    : {off_fp_calls}")
+    print(f"  dets fp=true / fp=false      : {tot_on} / {tot_off}")
+    print(f"  matched (IoU>0.5)            : {matched} ({100*matched/max(1,tot_off):.2f}% of fp=false)")
     print(f"  count-mismatch images        : {count_mm}")
     print(f"  class-id disagreements       : {class_disagree}")
     if ious:
@@ -159,10 +220,10 @@ def do_compare(on_path, off_path):
         print(f"  pixel-identical masks        : {pixel_identical}/{len(mask_iou)}")
     print()
     expected = n_imgs
-    ok_on  = "[PASS]" if on["triton_calls"]  == expected else "[FAIL]"
-    ok_off = "[PASS]" if off["triton_calls"] == 0 else "[FAIL]"
-    print(f"  {ok_on} env=true  -> Triton fired {on['triton_calls']}/{expected}")
-    print(f"  {ok_off} env=false -> Triton fired {off['triton_calls']} (expected 0)")
+    ok_on  = "[PASS]" if on_fp_calls  == expected else "[FAIL]"
+    ok_off = "[PASS]" if off_fp_calls == 0 else "[FAIL]"
+    print(f"  {ok_on} fp=true  -> fullpost fired {on_fp_calls}/{expected}")
+    print(f"  {ok_off} fp=false -> fullpost fired {off_fp_calls} (expected 0)")
 
 
 def main():
@@ -180,10 +241,10 @@ def main():
         do_compare(args.on, args.off)
         return
 
-    for env_value, out in (("true", OUT_ON), ("false", OUT_OFF)):
+    for fp_value, out in (("true", OUT_ON), ("false", OUT_OFF)):
         env = os.environ.copy()
-        env["INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED"] = env_value
-        print(f"\n---- child: env={env_value} out={out} ----", flush=True)
+        env["RFDETR_TRITON_FULLPOSTPROC"] = fp_value
+        print(f"\n---- child: fullpost={fp_value} out={out} ----", flush=True)
         subprocess.run([PY, str(SELF), "--mode", "run", "--out", out], check=True, env=env)
 
     do_compare(OUT_ON, OUT_OFF)
