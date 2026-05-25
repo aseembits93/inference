@@ -25,12 +25,6 @@ KSIZE_Y source rows; for each contributing source row we recompute the
 horizontal convolution (int32 fixed-point, uint8 quantize) on the fly,
 multiply by the vertical weight, and accumulate. Final: uint8 quantize,
 BGR↔RGB swap, /255, ImageNet normalize, fp32 CHW store.
-
-A separable two-pass variant (horizontal then vertical, via a DRAM uint8
-intermediate) is ~0.4 fps faster end-to-end on the 312² RF-DETR workload
-because it avoids redoing KSIZE_X MACs per output row. We picked the fused
-version for simplicity (no intermediate buffer, one launch, one piece of
-math).
 """
 
 from __future__ import annotations
@@ -40,6 +34,12 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+
+from inference_models.errors import (
+    MissingDependencyError,
+    ModelInputError,
+    ModelRuntimeError,
+)
 
 try:
     import triton
@@ -97,7 +97,7 @@ if TRITON_AVAILABLE:
     _HALF = 1 << (PRECISION_BITS - 1)
 
     @triton.jit
-    def _fused_resize_normalize_kernel(
+    def fused_resize_normalize_kernel(
         src_ptr,
         dst_ptr,
         ymin_ptr,
@@ -108,6 +108,8 @@ if TRITON_AVAILABLE:
         src_w,
         src_stride_h,
         src_stride_w,
+        crop_offset_y,
+        crop_offset_x,
         dst_stride_c,
         dst_stride_h,
         target_h,
@@ -130,7 +132,11 @@ if TRITON_AVAILABLE:
     ):
         """One kernel per (tile_y, tile_x) over target image.
 
-        In : src uint8 HWC (src_h, src_w, 3), source color order.
+        In : src uint8 HWC (src_h, src_w, 3), source color order. The
+             resample tables are built against `(crop_h, crop_w)` — the
+             logical source size after a possible static crop — which the
+             caller passes as `src_h`/`src_w`. `crop_offset_{y,x}` is the
+             load-time offset into the raw HWC buffer.
         Out: dst fp32 CHW (1, 3, target_h, target_w), network color order,
              (pixel/255 - mean)/std.
         """
@@ -152,9 +158,9 @@ if TRITON_AVAILABLE:
         vacc_2 = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.int32)
 
         for ky in tl.static_range(KSIZE_Y):
-            # Source row contributing to each output row in this tile.
+            # Source row (after static crop) contributing to each output row.
             sy = ymin + ky
-            sy_c = tl.maximum(tl.minimum(sy, src_h - 1), 0)
+            sy_c = tl.maximum(tl.minimum(sy, src_h - 1), 0) + crop_offset_y
             wy = tl.load(wy_ptr + offs_y * KSIZE_Y + ky, mask=mask_y, other=0)
 
             # Horizontal pass for (output_rows_in_tile, output_cols_in_tile):
@@ -166,7 +172,7 @@ if TRITON_AVAILABLE:
 
             for kx in tl.static_range(KSIZE_X):
                 sx = xmin + kx
-                sx_c = tl.maximum(tl.minimum(sx, src_w - 1), 0)
+                sx_c = tl.maximum(tl.minimum(sx, src_w - 1), 0) + crop_offset_x
                 wx = tl.load(wx_ptr + offs_x * KSIZE_X + kx, mask=mask_x, other=0)
                 base = sy_c[:, None] * src_stride_h + sx_c[None, :] * src_stride_w
                 p0 = tl.load(src_ptr + base + 0, mask=mask_out, other=0).to(tl.int32)
@@ -229,7 +235,7 @@ if TRITON_AVAILABLE:
         tl.store(dst_ptr + 2 * dst_stride_c + out_row, out_b, mask=mask_out)
 
 
-class _ResampleTables:
+class ResampleTables:
     """Cache of per-axis PIL-int32 weight tables for one (src, dst) pair."""
 
     __slots__ = (
@@ -264,10 +270,10 @@ def build_resample_tables(
     target_h: int,
     target_w: int,
     device: torch.device,
-) -> _ResampleTables:
+) -> ResampleTables:
     ymin, wy, ksize_y = _bilinear_antialias_weights_1d_int(src_h, target_h)
     xmin, wx, ksize_x = _bilinear_antialias_weights_1d_int(src_w, target_w)
-    return _ResampleTables(
+    return ResampleTables(
         ymin_gpu=torch.from_numpy(ymin).to(device=device, non_blocking=True),
         xmin_gpu=torch.from_numpy(xmin).to(device=device, non_blocking=True),
         wy_gpu=torch.from_numpy(wy.ravel()).to(device=device, non_blocking=True),
@@ -279,39 +285,62 @@ def build_resample_tables(
 
 def triton_preprocess_rfdetr_stretch(
     src: torch.Tensor,
-    tables: _ResampleTables,
+    tables: ResampleTables,
     target_h: int,
     target_w: int,
     means: Tuple[float, float, float] = (0.485, 0.456, 0.406),
     stds: Tuple[float, float, float] = (0.229, 0.224, 0.225),
     swap_rb: bool = True,
+    crop_offset_y: int = 0,
+    crop_offset_x: int = 0,
+    crop_h: Optional[int] = None,
+    crop_w: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused PIL-exact resize + color swap + normalize.
 
     Args:
         src: uint8 CUDA tensor, shape (H, W, 3), HWC layout.
-        tables: precomputed int32 resample tables from `build_resample_tables`.
+        tables: precomputed int32 resample tables sized against the *cropped*
+            source `(crop_h, crop_w)` → `(target_h, target_w)`.
         target_h, target_w: output spatial dims.
         means, stds: normalization in output channel order (R, G, B for
             network_input.color_mode == 'rgb').
         swap_rb: if True, source channel 0 → output B (BGR input, RGB network).
+        crop_offset_y/_x: load-time offset into `src` for a static crop. 0
+            means no crop.
+        crop_h/_w: effective source dims after crop. Defaults to src dims
+            when no crop is configured.
         out: optional preallocated fp32 (1, 3, H, W) CUDA tensor.
 
     Returns:
         fp32 (1, 3, target_h, target_w) on the same device as `src`.
     """
     if not TRITON_AVAILABLE:
-        raise RuntimeError("triton is not installed")
+        raise MissingDependencyError(
+            message="triton is not installed",
+            help_url="https://inference-models.roboflow.com/errors/runtime-environment/#missingdependencyerror",
+        )
     if not src.is_cuda:
-        raise ValueError(f"expected CUDA src tensor, got device={src.device}")
+        raise ModelInputError(
+            message=f"expected CUDA src tensor, got device={src.device}",
+            help_url="https://inference-models.roboflow.com/errors/input-validation/#modelinputerror",
+        )
     if src.dtype != torch.uint8:
-        raise ValueError(f"expected uint8 src, got {src.dtype}")
+        raise ModelInputError(
+            message=f"expected uint8 src, got {src.dtype}",
+            help_url="https://inference-models.roboflow.com/errors/input-validation/#modelinputerror",
+        )
     if src.ndim != 3 or src.shape[2] != 3:
-        raise ValueError(f"expected HWC 3-channel, got shape={tuple(src.shape)}")
+        raise ModelInputError(
+            message=f"expected HWC 3-channel, got shape={tuple(src.shape)}",
+            help_url="https://inference-models.roboflow.com/errors/input-validation/#modelinputerror",
+        )
 
     src = src.contiguous()
-    src_h, src_w = int(src.shape[0]), int(src.shape[1])
+    raw_src_h, raw_src_w = int(src.shape[0]), int(src.shape[1])
+    src_h = crop_h if crop_h is not None else raw_src_h
+    src_w = crop_w if crop_w is not None else raw_src_w
     src_stride_h = int(src.stride(0))
     src_stride_w = int(src.stride(1))
 
@@ -321,12 +350,18 @@ def triton_preprocess_rfdetr_stretch(
         )
     else:
         if tuple(out.shape) != (1, 3, target_h, target_w):
-            raise ValueError(
-                f"out has shape {tuple(out.shape)}, expected "
-                f"(1, 3, {target_h}, {target_w})"
+            raise ModelRuntimeError(
+                message=(
+                    f"out has shape {tuple(out.shape)}, expected "
+                    f"(1, 3, {target_h}, {target_w})"
+                ),
+                help_url="https://inference-models.roboflow.com/errors/models-runtime/#modelruntimeerror",
             )
         if out.dtype != torch.float32 or not out.is_cuda:
-            raise ValueError("out must be fp32 CUDA tensor")
+            raise ModelRuntimeError(
+                message="out must be fp32 CUDA tensor",
+                help_url="https://inference-models.roboflow.com/errors/models-runtime/#modelruntimeerror",
+            )
 
     dst_stride_c = target_h * target_w
     dst_stride_h = target_w
@@ -349,7 +384,7 @@ def triton_preprocess_rfdetr_stretch(
         (target_h + BLOCK_H - 1) // BLOCK_H,
         (target_w + BLOCK_W - 1) // BLOCK_W,
     )
-    _fused_resize_normalize_kernel[grid](
+    fused_resize_normalize_kernel[grid](
         src,
         out,
         tables.ymin_gpu,
@@ -360,6 +395,8 @@ def triton_preprocess_rfdetr_stretch(
         src_w,
         src_stride_h,
         src_stride_w,
+        int(crop_offset_y),
+        int(crop_offset_x),
         dst_stride_c,
         dst_stride_h,
         target_h,

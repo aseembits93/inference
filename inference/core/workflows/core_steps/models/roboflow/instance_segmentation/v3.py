@@ -16,6 +16,9 @@ from inference.core.env import (
     WORKFLOWS_REMOTE_EXECUTION_MAX_STEP_BATCH_SIZE,
     WORKFLOWS_REMOTE_EXECUTION_MAX_STEP_CONCURRENT_REQUESTS,
 )
+from inference.core.interfaces.stream.model_handlers.workflows_context import (
+    is_workflow_stream_flush_active,
+)
 from inference.core.managers.base import ModelManager
 from inference.core.workflows.core_steps.common.entities import StepExecutionMode
 from inference.core.workflows.core_steps.common.utils import (
@@ -227,6 +230,7 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
         self._model_manager = model_manager
         self._api_key = api_key
         self._step_execution_mode = step_execution_mode
+        self._last_model_id: Optional[str] = None
 
     @classmethod
     def get_init_parameters(cls) -> List[str]:
@@ -305,30 +309,36 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
         disable_active_learning: Optional[bool],
         active_learning_target_dataset: Optional[str],
     ) -> BlockResult:
-        inference_images = [i.to_inference_format(numpy_preferred=True) for i in images]
-        request = InstanceSegmentationInferenceRequest(
-            api_key=self._api_key,
-            model_id=model_id,
-            image=inference_images,
-            disable_active_learning=disable_active_learning,
-            active_learning_target_dataset=active_learning_target_dataset,
-            class_agnostic_nms=class_agnostic_nms,
-            class_filter=class_filter,
-            confidence=confidence,
-            iou_threshold=iou_threshold,
-            max_detections=max_detections,
-            max_candidates=max_candidates,
-            mask_decode_mode=mask_decode_mode,
-            tradeoff_factor=tradeoff_factor,
-            source="workflow-execution",
-        )
+        inference_images = [
+            i.to_inference_format(numpy_preferred=True) for i in images
+        ]
+        self._last_model_id = model_id
         self._model_manager.add_model(
             model_id=model_id,
             api_key=self._api_key,
         )
-        predictions = self._model_manager.infer_from_request_sync(
-            model_id=model_id, request=request
-        )
+        if is_workflow_stream_flush_active():
+            predictions = self._model_manager.flush(model_id=model_id)
+        else:
+            request = InstanceSegmentationInferenceRequest(
+                api_key=self._api_key,
+                model_id=model_id,
+                image=inference_images,
+                disable_active_learning=disable_active_learning,
+                active_learning_target_dataset=active_learning_target_dataset,
+                class_agnostic_nms=class_agnostic_nms,
+                class_filter=class_filter,
+                confidence=confidence,
+                iou_threshold=iou_threshold,
+                max_detections=max_detections,
+                max_candidates=max_candidates,
+                mask_decode_mode=mask_decode_mode,
+                tradeoff_factor=tradeoff_factor,
+                source="workflow-execution",
+            )
+            predictions = self._model_manager.infer_from_request_sync(
+                model_id=model_id, request=request
+            )
         if not isinstance(predictions, list):
             predictions = [predictions]
         # The adapter returns dataclass responses when source="workflow-execution"
@@ -346,6 +356,20 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
             predictions=predictions,
             class_filter=class_filter,
             model_id=model_id,
+        )
+
+    def is_stream_pipelined(self) -> bool:
+        if self._step_execution_mode is not StepExecutionMode.LOCAL:
+            return False
+        if (
+            self._last_model_id is None
+            or self._last_model_id not in self._model_manager
+        ):
+            return False
+        model = self._model_manager[self._last_model_id]
+        return (
+            callable(getattr(model, "flush", None))
+            and getattr(model, "_pipeline_depth", 1) > 1
         )
 
     def run_remotely(

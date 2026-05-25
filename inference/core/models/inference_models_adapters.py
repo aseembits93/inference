@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 from io import BytesIO
 from time import perf_counter
 from typing import Any, List, Optional, Tuple, Union
