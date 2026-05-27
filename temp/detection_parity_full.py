@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import pickle
 import re
@@ -36,10 +37,8 @@ from pathlib import Path
 from typing import Deque, Dict, Iterator, Optional
 
 
-SCRIPT_REPO_ROOT = Path(__file__).resolve().parents[1]
-COCO = Path(
-    os.environ.get("PARITY_COCO_DIR", str(SCRIPT_REPO_ROOT / "coco" / "val2017"))
-)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_REPO_ROOT = REPO_ROOT
 MODEL_ID = os.environ.get("PARITY_MODEL_ID", "rfdetr-seg-nano")
 CONFIDENCE = 0.4
 PY = sys.executable
@@ -52,6 +51,85 @@ ALL_FLAGS = {
     "INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED": "true",
     "RFDETR_PIPELINE_DEPTH": "2",
 }
+TRT_PACKAGE_SUFFIXES = (
+    "-orin-trt-package",
+    "-trt-package",
+)
+TRT_PACKAGE_REQUIRED_FILES = (
+    "model_config.json",
+    "class_names.txt",
+    "inference_config.json",
+)
+
+
+def _resolve_coco_dir(value: Optional[str]) -> Path:
+    if value:
+        return Path(value).expanduser().resolve()
+    return (REPO_ROOT / "coco" / "val2017").resolve()
+
+
+COCO = _resolve_coco_dir(os.environ.get("PARITY_COCO_DIR"))
+
+
+def _is_trt_package(package_dir: Path) -> bool:
+    if not package_dir.is_dir():
+        return False
+    if not all((package_dir / filename).exists() for filename in TRT_PACKAGE_REQUIRED_FILES):
+        return False
+    if not any(
+        (package_dir / filename).exists()
+        for filename in ("engine.plan", "weights.onnx")
+    ):
+        return False
+
+    model_config_path = package_dir / "model_config.json"
+    try:
+        model_config = json.loads(model_config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return model_config.get("backend_type") == "trt"
+
+
+def _iter_local_model_packages(model_id: str) -> Iterator[Path]:
+    explicit_model_path = os.environ.get("PARITY_MODEL_PATH")
+    if explicit_model_path:
+        yield Path(explicit_model_path).expanduser()
+
+    package_names = [f"{model_id}{suffix}" for suffix in TRT_PACKAGE_SUFFIXES]
+    search_roots = (
+        Path.cwd(),
+        REPO_ROOT,
+        Path(tempfile.gettempdir()),
+    )
+    for search_root in search_roots:
+        for package_name in package_names:
+            yield search_root / package_name
+
+
+def _iter_cached_model_packages(model_id: str) -> Iterator[Path]:
+    inference_home = os.environ.get("INFERENCE_HOME")
+    if not inference_home:
+        return
+
+    models_cache_root = Path(inference_home).expanduser() / "models-cache"
+    if not models_cache_root.exists():
+        return
+
+    for model_root in sorted(models_cache_root.glob(f"{model_id}-*")):
+        for package_dir in sorted(model_root.glob("*")):
+            yield package_dir
+
+
+def _resolve_model_reference(model_id: str) -> str:
+    for package_dir in _iter_local_model_packages(model_id):
+        if _is_trt_package(package_dir):
+            return str(package_dir.resolve())
+
+    for package_dir in _iter_cached_model_packages(model_id):
+        if _is_trt_package(package_dir):
+            return str(package_dir.resolve())
+
+    return model_id
 
 
 def _iter_pickles(path: str) -> Iterator[dict]:
@@ -66,17 +144,42 @@ def _iter_pickles(path: str) -> Iterator[dict]:
 def _bootstrap_repo_root(repo_root: str) -> Path:
     repo_path = Path(repo_root).resolve()
     os.chdir(repo_path)
-    search_roots = [
-        repo_path,
-        repo_path / "inference_models",
+    _prioritize_local_packages(repo_path)
+    return repo_path
+
+
+def _repo_import_roots(repo_root: Path) -> list[Path]:
+    return [
+        repo_root,
+        repo_root / "inference_models",
     ]
+
+
+def _prioritize_local_packages(repo_root: Path) -> None:
+    search_roots = _repo_import_roots(repo_root)
     for search_root in reversed(search_roots):
         search_root_str = str(search_root)
         if search_root_str in sys.path:
             sys.path.remove(search_root_str)
         if search_root.exists():
             sys.path.insert(0, search_root_str)
-    return repo_path
+
+    # Force subsequent imports to come from the selected checkout rather than
+    # any already-imported site-packages copy in the current interpreter.
+    for module_name in list(sys.modules):
+        if module_name == "inference" or module_name.startswith("inference."):
+            sys.modules.pop(module_name, None)
+        if module_name == "inference_models" or module_name.startswith(
+            "inference_models."
+        ):
+            sys.modules.pop(module_name, None)
+
+
+def _child_pythonpath(repo_root: Path, existing_pythonpath: Optional[str]) -> str:
+    entries = [str(path) for path in _repo_import_roots(repo_root) if path.exists()]
+    if existing_pythonpath:
+        entries.append(existing_pythonpath)
+    return os.pathsep.join(entries)
 
 
 def _git_output(repo_root: Path, *args: str) -> str:
@@ -243,6 +346,12 @@ def do_run(out_path: str, repo_root: str, label: Optional[str]) -> None:
         "DISABLED_INFERENCE_MODELS_BACKENDS",
         "torch,torch-script,onnx,hugging-face,ultralytics,custom",
     )
+    model_reference = _resolve_model_reference(MODEL_ID)
+    if os.path.exists(model_reference):
+        os.environ.setdefault(
+            "ALLOW_INFERENCE_MODELS_DIRECTLY_ACCESS_LOCAL_PACKAGES",
+            "true",
+        )
     if not COCO.exists():
         raise FileNotFoundError(f"Missing COCO directory: {COCO}")
 
@@ -278,7 +387,7 @@ def do_run(out_path: str, repo_root: str, label: Optional[str]) -> None:
 
         common_mod.rfdetr_triton_postproc = counting_postproc
 
-    model = InferenceModelsInstanceSegmentationAdapter(MODEL_ID)
+    model = InferenceModelsInstanceSegmentationAdapter(model_reference)
     pipeline_depth = getattr(model, "_pipeline_depth", 1)
     resolved_label = label or _safe_git_output(
         repo_path, "rev-parse", "--abbrev-ref", "HEAD", default=repo_path.name
@@ -288,6 +397,7 @@ def do_run(out_path: str, repo_root: str, label: Optional[str]) -> None:
     print(
         "[run] "
         f"label={resolved_label} repo_root={repo_path} head={signature['git_head']} "
+        f"model_reference={model_reference} "
         f"RFDETR_TRITON_POSTPROC={os.environ.get('RFDETR_TRITON_POSTPROC', '<unset>')} "
         f"INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED="
         f"{os.environ.get('INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED', '<unset>')} "
@@ -304,6 +414,7 @@ def do_run(out_path: str, repo_root: str, label: Optional[str]) -> None:
         "label": resolved_label,
         "repo_root": str(repo_path),
         "model_id": MODEL_ID,
+        "model_reference": model_reference,
         "confidence": CONFIDENCE,
         "flags": dict(ALL_FLAGS),
         "git_head": signature["git_head"],
@@ -636,12 +747,17 @@ def do_compare(base_path: str, candidate_path: str) -> None:
 def _run_child(repo_root: Path, label: str, out_path: str) -> None:
     env = os.environ.copy()
     env.update(ALL_FLAGS)
+    env["PYTHONPATH"] = _child_pythonpath(
+        repo_root=repo_root,
+        existing_pythonpath=env.get("PYTHONPATH"),
+    )
     print(
         "\n---- child ----\n"
         f"  label={label}\n"
         f"  repo_root={repo_root}\n"
         f"  out={out_path}\n"
-        f"  flags={ALL_FLAGS}",
+        f"  flags={ALL_FLAGS}\n"
+        f"  PYTHONPATH={env['PYTHONPATH']}",
         flush=True,
     )
     subprocess.run(
