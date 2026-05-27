@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -125,6 +125,9 @@ class ModelManagerDecorator(ModelManager):
             InferenceResponse: The response from the inference.
         """
         return self.model_manager.infer_from_request_sync(model_id, request, **kwargs)
+
+    def flush(self, model_id: str) -> Union[List[InferenceResponse], InferenceResponse]:
+        return self.model_manager.flush(model_id)
 
     def infer_only(self, model_id: str, request, img_in, img_dims, batch_size=None):
         """Performs only the inference part of a request.

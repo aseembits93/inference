@@ -429,6 +429,15 @@ class ModelManager:
         model = self._get_model_reference(model_id=model_id)
         return model.infer_from_request(request)
 
+    def flush(
+        self, model_id: str
+    ) -> Union[List[InferenceResponse], InferenceResponse]:
+        model = self._get_model_reference(model_id=model_id)
+        flush_fn = getattr(model, "flush", None)
+        if not callable(flush_fn):
+            return []
+        return flush_fn()
+
     def make_response(
         self, model_id: str, predictions: List[List[float]], *args, **kwargs
     ) -> InferenceResponse:

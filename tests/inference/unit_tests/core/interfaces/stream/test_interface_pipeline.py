@@ -28,7 +28,10 @@ from inference.core.interfaces.camera.video_source import (
     VideoSource,
     lock_state_transition,
 )
-from inference.core.interfaces.stream.entities import ModelConfig
+from inference.core.interfaces.stream.entities import (
+    InferenceHandlerResult,
+    ModelConfig,
+)
 from inference.core.interfaces.stream.inference_pipeline import InferencePipeline
 from inference.core.interfaces.stream.model_handlers.roboflow_models import (
     default_process_frame,
@@ -138,6 +141,80 @@ class ModelStub:
                 image=InferenceResponseImage(width=1920, height=1080),
             )
         ] * len(image)
+
+
+class BufferedHandlerStub:
+    def __init__(self):
+        self._pending_video_frames: Optional[List[VideoFrame]] = None
+
+    def __call__(
+        self, video_frames: List[VideoFrame]
+    ) -> Optional[InferenceHandlerResult]:
+        previous_video_frames = self._pending_video_frames
+        self._pending_video_frames = video_frames
+        if previous_video_frames is None:
+            return None
+        return InferenceHandlerResult(
+            predictions=[
+                {
+                    "frame_id": frame.frame_id,
+                }
+                for frame in previous_video_frames
+            ],
+            video_frames=previous_video_frames,
+        )
+
+    def flush(self) -> Optional[InferenceHandlerResult]:
+        if self._pending_video_frames is None:
+            return None
+        emit_video_frames = self._pending_video_frames
+        self._pending_video_frames = None
+        return InferenceHandlerResult(
+            predictions=[
+                {
+                    "frame_id": frame.frame_id,
+                }
+                for frame in emit_video_frames
+            ],
+            video_frames=emit_video_frames,
+        )
+
+
+def test_inference_pipeline_drains_buffered_handler_tail() -> None:
+    # given
+    frames = [
+        [
+            VideoFrame(
+                image=np.zeros((8, 8, 3), dtype=np.uint8),
+                frame_id=frame_id,
+                frame_timestamp=datetime.now(),
+                source_id=0,
+            )
+        ]
+        for frame_id in [1, 2, 3]
+    ]
+    watchdog = MagicMock()
+    status_update_handlers = []
+    predictions = []
+    inference_pipeline = InferencePipeline(
+        on_video_frame=BufferedHandlerStub(),
+        video_sources=[],
+        on_prediction=lambda prediction, video_frame: predictions.append(
+            (video_frame.frame_id, prediction["frame_id"])
+        ),
+        max_fps=None,
+        predictions_queue=Queue(maxsize=16),
+        watchdog=watchdog,
+        status_update_handlers=status_update_handlers,
+    )
+    inference_pipeline._generate_frames = lambda: iter(frames)
+
+    # when
+    inference_pipeline.start(use_main_thread=False)
+    inference_pipeline.join()
+
+    # then
+    assert predictions == [(1, 1), (2, 2), (3, 3)]
 
 
 @pytest.mark.timeout(90)
