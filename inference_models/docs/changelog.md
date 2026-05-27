@@ -1,5 +1,11 @@
 # Changelog
 
+## `0.29.0`
+
+### Added
+
+- Custom Triton Kernel for RFDETR pre-processing (Codeflash). Numerical parity with `PIL → F.resize → F.to_tensor → F.normalize` chain.
+
 ## `0.28.1`
 
 ### Fixed
