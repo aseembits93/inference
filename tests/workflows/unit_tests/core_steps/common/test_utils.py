@@ -432,6 +432,61 @@ def test_sv_detections_to_root_coordinates_when_detections_without_root_coordina
     ), "Expected detections not to be mutated when root metadata not provided"
 
 
+def test_sv_detections_to_root_coordinates_when_already_in_root_coordinates() -> None:
+    # given
+    mask = np.zeros((2, 200, 100), dtype=np.bool_)
+    mask[0, 80:121, 30:71] = True
+    mask[1, 170:191, 70:91] = True
+    detections = sv.Detections(
+        xyxy=np.array([[25, 50, 75, 150], [50, 125, 100, 225]]),
+        mask=mask,
+        confidence=np.array([0.1, 0.2]),
+        class_id=np.array([1, 0]),
+        tracker_id=np.array([1, 2]),
+        data={
+            "class_name": np.array(["dog", "cat"]),
+            "detection_id": np.array(["first", "second"]),
+            "parent_id": np.array(["root", "root"]),
+            "parent_coordinates": np.array([[0, 0], [0, 0]]),
+            "parent_dimensions": np.array([[200, 100], [200, 100]]),
+            "root_parent_id": np.array(["root", "root"]),
+            "root_parent_coordinates": np.array([[0, 0], [0, 0]]),
+            "root_parent_dimensions": np.array([[200, 100], [200, 100]]),
+            "image_dimensions": np.array([[200, 100], [200, 100]]),
+        },
+    )
+
+    # when
+    result = sv_detections_to_root_coordinates(detections=detections)
+
+    # then
+    assert np.allclose(
+        result.xyxy,
+        np.array([[25, 50, 75, 150], [50, 125, 100, 225]]),
+    ), "Expected root-aligned coordinates not to be shifted"
+    assert result.xyxy is detections.xyxy, "Expected no-op path to reuse xyxy storage"
+    assert result.mask is detections.mask, "Expected no-op path to reuse mask storage"
+    assert np.allclose(
+        result.mask, mask
+    ), "Expected root-aligned masks not to be re-anchored"
+    assert (
+        result["scaling_relative_to_parent"] == np.array([1.0, 1.0], dtype=np.float32)
+    ).all(), "Expected parent scaling to be set to 1.0"
+    assert (
+        result["scaling_relative_to_root_parent"]
+        == np.array([1.0, 1.0], dtype=np.float32)
+    ).all(), "Expected root scaling to be set to 1.0"
+    assert (
+        result["image_dimensions"] == np.array([[200, 100], [200, 100]], dtype=np.int32)
+    ).all(), "Expected image dimensions to stay rooted"
+    assert (
+        result["parent_id"] == np.array(["root", "root"])
+    ).all(), "Expected parent metadata not to change"
+    assert (
+        result["root_parent_id"] == np.array(["root", "root"])
+    ).all(), "Expected root metadata not to change"
+
+
 def test_sv_detections_to_root_coordinates_when_shift_is_needed() -> None:
     # given
     mask = np.zeros((2, 200, 100), dtype=np.bool_)

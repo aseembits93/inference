@@ -4,6 +4,7 @@ import shutil
 from typing import List, Literal, Optional, Tuple, Union
 
 import onnxruntime
+import tensorrt as trt
 
 from inference_models.configuration import ROBOFLOW_API_KEY
 from inference_models.logger import LOGGER
@@ -36,6 +37,13 @@ def compile_model(
     workspace_size_gb: int = 8,
     trt_version_compatible: bool = False,
     same_compute_compatibility: bool = False,
+    builder_optimization_level: Optional[int] = None,
+    max_aux_streams: Optional[int] = None,
+    tiling_optimization_level: Optional[str] = None,
+    profile_sharing_0806: bool = False,
+    avg_timing_iterations: Optional[int] = None,
+    max_num_tactics: Optional[int] = None,
+    tactic_sources: Optional[List[str]] = None,
 ) -> None:
     if not roboflow_api_key:
         roboflow_api_key = ROBOFLOW_API_KEY
@@ -74,6 +82,13 @@ def compile_model(
                 workspace_size_gb=workspace_size_gb,
                 trt_version_compatible=trt_version_compatible,
                 same_compute_compatibility=same_compute_compatibility,
+                builder_optimization_level=builder_optimization_level,
+                max_aux_streams=max_aux_streams,
+                tiling_optimization_level=tiling_optimization_level,
+                profile_sharing_0806=profile_sharing_0806,
+                avg_timing_iterations=avg_timing_iterations,
+                max_num_tactics=max_num_tactics,
+                tactic_sources=tactic_sources,
             )
         except Exception as e:
             LOGGER.exception(f"Failed to create engine: {e}")
@@ -169,9 +184,17 @@ def compile_model_to_trt(
     workspace_size_gb: int = 8,
     trt_version_compatible: bool = False,
     same_compute_compatibility: bool = False,
+    builder_optimization_level: Optional[int] = None,
+    max_aux_streams: Optional[int] = None,
+    tiling_optimization_level: Optional[str] = None,
+    profile_sharing_0806: bool = False,
+    avg_timing_iterations: Optional[int] = None,
+    max_num_tactics: Optional[int] = None,
+    tactic_sources: Optional[List[str]] = None,
 ) -> None:
     print(f"Compiling model in {model_dir}")
     runtime_xray = x_ray_runtime_environment()
+    runtime_xray_dict = runtime_xray.__dict__
     xray_path = os.path.join(model_dir, "env-x-ray.json")
     dump_json(
         path=xray_path,
@@ -207,7 +230,7 @@ def compile_model_to_trt(
                 else None
             ),
             "hf_transformers_available": runtime_xray.hf_transformers_available,
-            "ultralytics_available": runtime_xray.ultralytics_available,
+            "ultralytics_available": runtime_xray_dict.get("ultralytics_available"),
             "trt_python_package_available": runtime_xray.trt_python_package_available,
         },
     )
@@ -251,9 +274,35 @@ def compile_model_to_trt(
             "trt_version_compatible": trt_version_compatible,
             "same_compute_compatibility": same_compute_compatibility,
             "precision": precision,
+            "builder_optimization_level": builder_optimization_level,
+            "max_aux_streams": max_aux_streams,
+            "tiling_optimization_level": tiling_optimization_level,
+            "profile_sharing_0806": profile_sharing_0806,
+            "avg_timing_iterations": avg_timing_iterations,
+            "max_num_tactics": max_num_tactics,
+            "tactic_sources": tactic_sources,
         },
     )
-    engine_builder = EngineBuilder(workspace=workspace_size_gb)
+    tiling_enum = None
+    if tiling_optimization_level is not None:
+        level = tiling_optimization_level.strip().upper()
+        try:
+            tiling_enum = getattr(trt.TilingOptimizationLevel, level)
+        except AttributeError as error:
+            raise ValueError(
+                "tiling_optimization_level must be one of: "
+                "none, fast, moderate, full"
+            ) from error
+    engine_builder = EngineBuilder(
+        workspace=workspace_size_gb,
+        builder_optimization_level=builder_optimization_level,
+        max_aux_streams=max_aux_streams,
+        tiling_optimization_level=tiling_enum,
+        profile_sharing_0806=profile_sharing_0806,
+        avg_timing_iterations=avg_timing_iterations,
+        max_num_tactics=max_num_tactics,
+        tactic_sources=translate_tactic_sources(tactic_sources),
+    )
     engine_builder.create_network(onnx_path=onnx_path)
     engine_builder.create_engine(
         engine_path=engine_path,
@@ -269,3 +318,14 @@ def compile_model_to_trt(
 def dump_json(path: str, contents: dict) -> None:
     with open(path, "w") as f:
         json.dump(contents, f, indent=4)
+
+
+def translate_tactic_sources(
+    tactic_sources: Optional[List[str]],
+) -> Optional[List[trt.TacticSource]]:
+    if tactic_sources is None:
+        return None
+    result: List[trt.TacticSource] = []
+    for tactic_source in tactic_sources:
+        result.append(getattr(trt.TacticSource, tactic_source))
+    return result

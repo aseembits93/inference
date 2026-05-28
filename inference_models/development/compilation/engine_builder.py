@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Literal, Optional, Tuple
+from typing import Iterable, Literal, Optional, Tuple
 
 import tensorrt as trt
 
@@ -15,7 +15,17 @@ class EngineBuilder:
     Parses an ONNX graph and builds a TensorRT engine from it.
     """
 
-    def __init__(self, workspace: int = 8):
+    def __init__(
+        self,
+        workspace: int = 8,
+        builder_optimization_level: Optional[int] = None,
+        max_aux_streams: Optional[int] = None,
+        tiling_optimization_level: Optional[trt.TilingOptimizationLevel] = None,
+        profile_sharing_0806: bool = False,
+        avg_timing_iterations: Optional[int] = None,
+        max_num_tactics: Optional[int] = None,
+        tactic_sources: Optional[Iterable[trt.TacticSource]] = None,
+    ):
         self.trt_logger = InferenceTRTLogger()
         trt.init_libnvinfer_plugins(self.trt_logger, namespace="")
         self.builder = trt.Builder(self.trt_logger)
@@ -23,6 +33,25 @@ class EngineBuilder:
         self.config.set_memory_pool_limit(
             trt.MemoryPoolType.WORKSPACE, workspace * (2**30)
         )
+        if builder_optimization_level is not None:
+            self.config.builder_optimization_level = builder_optimization_level
+        if max_aux_streams is not None:
+            self.config.max_aux_streams = max_aux_streams
+        if tiling_optimization_level is not None:
+            self.config.tiling_optimization_level = tiling_optimization_level
+        if profile_sharing_0806:
+            self.config.set_preview_feature(
+                trt.PreviewFeature.PROFILE_SHARING_0806, True
+            )
+        if avg_timing_iterations is not None:
+            self.config.avg_timing_iterations = avg_timing_iterations
+        if max_num_tactics is not None:
+            self.config.max_num_tactics = max_num_tactics
+        if tactic_sources is not None:
+            tactic_sources_mask = 0
+            for source in tactic_sources:
+                tactic_sources_mask |= 1 << int(source)
+            self.config.set_tactic_sources(tactic_sources_mask)
 
         self.network = None
         self.parser = None

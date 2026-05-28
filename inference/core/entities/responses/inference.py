@@ -1,4 +1,5 @@
 import base64
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
@@ -271,6 +272,113 @@ class InstanceSegmentationInferenceResponse(
     predictions: List[
         Union[InstanceSegmentationPrediction, InstanceSegmentationRLEPrediction]
     ]
+
+
+INSTANCE_SEGMENTATION_WORKFLOW_V3_FAST_SOURCE = (
+    "workflow-execution-instance-segmentation-v3-fast"
+)
+
+
+# Dataclass twins used on the v3 workflow-local fast path in
+# `InferenceModelsInstanceSegmentationAdapter.postprocess`. The v3 block can
+# consume a ready `sv.Detections` payload directly, so it does not need the
+# pydantic interface. HTTP / cache / visualization paths still receive the
+# pydantic `InstanceSegmentationInferenceResponse`.
+@dataclass(slots=True)
+class PointDC:
+    x: float
+    y: float
+
+
+@dataclass(slots=True)
+class InferenceResponseImageDC:
+    width: int
+    height: int
+
+
+@dataclass(slots=True)
+class InstanceSegmentationPredictionDC:
+    x: float
+    y: float
+    width: float
+    height: float
+    confidence: float
+    class_name: str  # serialized as "class" in the dict form
+    class_id: int
+    points: list  # list[PointDC]
+    detection_id: str = field(default_factory=lambda: str(uuid4()))
+    parent_id: object = None
+    class_confidence: object = None
+
+
+@dataclass(slots=True)
+class InstanceSegmentationInferenceResponseDC:
+    predictions: list  # list[InstanceSegmentationPredictionDC]
+    image: InferenceResponseImageDC
+    sv_detections: object = None
+    # `Model.infer_from_request` assigns .time and .inference_id after
+    # construction (see inference/core/models/base.py:154-157); they're
+    # declared here so the slotted dataclass permits the reassignment.
+    inference_id: object = None
+    frame_id: object = None
+    time: object = None
+    visualization: object = None
+
+
+def _is_pred_dc_to_dict(p: InstanceSegmentationPredictionDC) -> dict:
+    """Bit-equivalent to `InstanceSegmentationPrediction(...).model_dump(by_alias=True, exclude_none=True)`."""
+    d = {
+        "x": p.x,
+        "y": p.y,
+        "width": p.width,
+        "height": p.height,
+        "confidence": p.confidence,
+        "class": p.class_name,  # alias
+        "class_id": p.class_id,
+        "detection_id": p.detection_id,
+        "points": [{"x": pt.x, "y": pt.y} for pt in p.points],
+    }
+    if p.class_confidence is not None:
+        d["class_confidence"] = p.class_confidence
+    if p.parent_id is not None:
+        d["parent_id"] = p.parent_id
+    return d
+
+
+def _workflow_points_to_dict(points) -> list:
+    if len(points) == 0:
+        return []
+    first_point = points[0]
+    if isinstance(first_point, dict):
+        return points
+    if hasattr(first_point, "x") and hasattr(first_point, "y"):
+        return [{"x": pt.x, "y": pt.y} for pt in points]
+    return [{"x": float(pt[0]), "y": float(pt[1])} for pt in points]
+
+
+def _is_response_dc_to_dict(r: InstanceSegmentationInferenceResponseDC) -> dict:
+    """Bit-equivalent to `InstanceSegmentationInferenceResponse(...).model_dump(by_alias=True, exclude_none=True)`."""
+    predictions = []
+    for prediction in r.predictions:
+        if isinstance(prediction, dict):
+            pred_dict = prediction.copy()
+            pred_dict["points"] = _workflow_points_to_dict(pred_dict["points"])
+            predictions.append(pred_dict)
+        else:
+            predictions.append(_is_pred_dc_to_dict(prediction))
+    d = {
+        "image": {"width": r.image.width, "height": r.image.height},
+        "predictions": predictions,
+    }
+    if r.inference_id is not None:
+        d["inference_id"] = r.inference_id
+    if r.frame_id is not None:
+        d["frame_id"] = r.frame_id
+    if r.time is not None:
+        d["time"] = r.time
+    if r.visualization is not None:
+        d["visualization"] = r.visualization
+    return d
 
 
 class SemanticSegmentationInferenceResponse(

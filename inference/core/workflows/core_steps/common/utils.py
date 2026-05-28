@@ -100,7 +100,18 @@ def attach_prediction_type_info_to_sv_detections_batch(
     key: str = PREDICTION_TYPE_KEY,
 ) -> List[sv.Detections]:
     for prediction in predictions:
-        prediction[key] = np.array([prediction_type] * len(prediction))
+        existing = prediction.data.get(key)
+        if (
+            existing is not None
+            and len(existing) == get_sv_detections_fast_size(prediction)
+            and (len(existing) == 0 or np.all(existing == prediction_type))
+        ):
+            continue
+        prediction[key] = np.full(
+            (get_sv_detections_fast_size(prediction),),
+            prediction_type,
+            dtype=object,
+        )
     return predictions
 
 
@@ -229,24 +240,41 @@ def attach_parent_coordinates_to_detections(
     coordinates_key: str,
     dimensions_key: str,
 ) -> sv.Detections:
+    n_detections = get_sv_detections_fast_size(detections)
     parent_coordinates_system = parent_metadata.origin_coordinates
-    detections[parent_id_key] = np.array([parent_metadata.parent_id] * len(detections))
-    coordinates = np.array(
-        [[parent_coordinates_system.left_top_x, parent_coordinates_system.left_top_y]]
-        * len(detections)
+    detections[parent_id_key] = np.full(
+        (n_detections,), parent_metadata.parent_id, dtype=object
+    )
+    coordinates = np.broadcast_to(
+        np.array(
+            [
+                parent_coordinates_system.left_top_x,
+                parent_coordinates_system.left_top_y,
+            ],
+            dtype=np.int32,
+        ),
+        (n_detections, 2),
     )
     detections[coordinates_key] = coordinates
-    dimensions = np.array(
-        [
+    dimensions = np.broadcast_to(
+        np.array(
             [
                 parent_coordinates_system.origin_height,
                 parent_coordinates_system.origin_width,
-            ]
-        ]
-        * len(detections)
+            ],
+            dtype=np.int32,
+        ),
+        (n_detections, 2),
     )
     detections[dimensions_key] = dimensions
     return detections
+
+
+def get_sv_detections_fast_size(detections: sv.Detections) -> int:
+    fast_len_hint = getattr(detections, "_fast_len_hint", None)
+    if callable(fast_len_hint):
+        return int(fast_len_hint())
+    return len(detections)
 
 
 KEYS_REQUIRED_TO_EMBED_IN_ROOT_COORDINATES = {
@@ -256,9 +284,116 @@ KEYS_REQUIRED_TO_EMBED_IN_ROOT_COORDINATES = {
 }
 
 
+def _shallow_clone_sv_detections(detections: sv.Detections) -> sv.Detections:
+    clone_fast = getattr(detections, "_shallow_clone_fast", None)
+    if callable(clone_fast):
+        return clone_fast()
+    return sv.Detections(
+        xyxy=detections.xyxy,
+        mask=detections.mask,
+        confidence=detections.confidence,
+        class_id=detections.class_id,
+        tracker_id=detections.tracker_id,
+        data=dict(detections.data),
+        metadata=dict(detections.metadata),
+    )
+
+
+def _sv_detections_root_conversion_is_noop(
+    detections: sv.Detections,
+) -> bool:
+    if get_sv_detections_fast_size(detections) == 0:
+        return False
+    if any(key not in detections.data for key in KEYS_REQUIRED_TO_EMBED_IN_ROOT_COORDINATES):
+        return False
+
+    root_parent_coordinates = detections.data.get(ROOT_PARENT_COORDINATES_KEY)
+    root_parent_dimensions = detections.data.get(ROOT_PARENT_DIMENSIONS_KEY)
+    if root_parent_coordinates is None or root_parent_dimensions is None:
+        return False
+    if len(root_parent_coordinates) == 0 or len(root_parent_dimensions) == 0:
+        return False
+    if not np.all(root_parent_coordinates == 0):
+        return False
+
+    parent_coordinates = detections.data.get(PARENT_COORDINATES_KEY)
+    parent_dimensions = detections.data.get(PARENT_DIMENSIONS_KEY)
+    if parent_coordinates is None or parent_dimensions is None:
+        return False
+    if len(parent_coordinates) == 0 or len(parent_dimensions) == 0:
+        return False
+    if not np.all(parent_coordinates == 0):
+        return False
+    if not np.array_equal(parent_dimensions, root_parent_dimensions):
+        return False
+
+    parent_ids = detections.data.get(PARENT_ID_KEY)
+    root_parent_ids = detections.data.get(ROOT_PARENT_ID_KEY)
+    if parent_ids is None or root_parent_ids is None:
+        return False
+    if len(parent_ids) == 0 or len(root_parent_ids) == 0:
+        return False
+    if not np.array_equal(parent_ids, root_parent_ids):
+        return False
+
+    image_dimensions = detections.data.get(IMAGE_DIMENSIONS_KEY)
+    if image_dimensions is None:
+        return False
+    if len(image_dimensions) == 0:
+        return False
+    if not np.array_equal(image_dimensions, root_parent_dimensions):
+        return False
+
+    scaling_relative_to_parent = detections.data.get(SCALING_RELATIVE_TO_PARENT_KEY)
+    if scaling_relative_to_parent is not None and not np.allclose(
+        scaling_relative_to_parent, 1.0
+    ):
+        return False
+    scaling_relative_to_root_parent = detections.data.get(
+        SCALING_RELATIVE_TO_ROOT_PARENT_KEY
+    )
+    if scaling_relative_to_root_parent is not None and not np.allclose(
+        scaling_relative_to_root_parent, 1.0
+    ):
+        return False
+
+    raw_mask = object.__getattribute__(detections, "mask")
+    if raw_mask is not None:
+        origin_height = int(root_parent_dimensions[0][0])
+        origin_width = int(root_parent_dimensions[0][1])
+        if tuple(raw_mask.shape[1:]) != (origin_height, origin_width):
+            return False
+    else:
+        mask_shape_matches_root = getattr(
+            detections, "_mask_shape_matches_root_dimensions_fast", None
+        )
+        if callable(mask_shape_matches_root) and not mask_shape_matches_root():
+            return False
+    return True
+
+
 def sv_detections_to_root_coordinates(
     detections: sv.Detections, keypoints_key: str = KEYPOINTS_XY_KEY_IN_SV_DETECTIONS
 ) -> sv.Detections:
+    n_detections = get_sv_detections_fast_size(detections)
+    if n_detections == 0:
+        return _shallow_clone_sv_detections(detections=detections)
+    if _sv_detections_root_conversion_is_noop(detections=detections):
+        detections_copy = _shallow_clone_sv_detections(detections=detections)
+        fast_copy_size = get_sv_detections_fast_size(detections_copy)
+        scaling = np.ones((fast_copy_size,), dtype=np.float32)
+        detections_copy[SCALING_RELATIVE_TO_PARENT_KEY] = scaling
+        detections_copy[SCALING_RELATIVE_TO_ROOT_PARENT_KEY] = scaling.copy()
+        if fast_copy_size:
+            origin_height = int(detections_copy[ROOT_PARENT_DIMENSIONS_KEY][0][0])
+            origin_width = int(detections_copy[ROOT_PARENT_DIMENSIONS_KEY][0][1])
+            detections_copy[IMAGE_DIMENSIONS_KEY] = np.repeat(
+                np.array([[origin_height, origin_width]], dtype=np.int32),
+                fast_copy_size,
+                axis=0,
+            )
+        return detections_copy
+
     detections_copy = deepcopy(detections)
     if len(detections_copy) == 0:
         return detections_copy

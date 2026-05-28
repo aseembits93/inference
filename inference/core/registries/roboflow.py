@@ -1,4 +1,5 @@
 import os
+import os
 from typing import Any, Dict, Optional, Tuple, Union
 
 from cachetools.func import ttl_cache
@@ -82,6 +83,28 @@ FINE_TUNED_SAM3_DEPLOYMENT_ERROR = (
     "Fine-tuned SAM3 models are not supported on this deployment. "
     "Please use a workflow or self-host the server."
 )
+
+
+def _get_local_model_type(model_id: str) -> Optional[Tuple[TaskType, ModelType]]:
+    is_explicit_local_path = os.path.isabs(model_id) or model_id.startswith(".")
+    if not is_explicit_local_path or not os.path.isdir(model_id):
+        return None
+    model_config_path = os.path.join(model_id, "model_config.json")
+    if not os.path.isfile(model_config_path):
+        return None
+    parsed_config = read_json(model_config_path)
+    if not isinstance(parsed_config, dict):
+        raise ModelArtefactError(
+            f"Local model package config at {model_config_path} is malformed."
+        )
+    task_type = parsed_config.get("task_type")
+    model_type = parsed_config.get("model_architecture")
+    if not isinstance(task_type, str) or not isinstance(model_type, str):
+        raise ModelArtefactError(
+            f"Local model package config at {model_config_path} does not define "
+            "`task_type` and `model_architecture`."
+        )
+    return task_type, model_type
 
 
 class RoboflowModelRegistry(ModelRegistry):
@@ -183,6 +206,10 @@ def get_model_type(
         MissingDefaultModelError: If default model is not configured and API does not provide this info
         MalformedRoboflowAPIResponseError: Roboflow API responds in invalid format.
     """
+
+    local_model_type = _get_local_model_type(model_id=model_id)
+    if local_model_type is not None:
+        return local_model_type
 
     model_id = resolve_roboflow_model_alias(model_id=model_id)
     dataset_id, version_id = get_model_id_chunks(model_id=model_id)

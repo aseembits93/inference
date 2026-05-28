@@ -1,7 +1,7 @@
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -78,6 +78,16 @@ class TRTCudaGraphState:
     input_buffer: torch.Tensor
     output_buffers: List[torch.Tensor]
     execution_context: trt.IExecutionContext
+    consumer_done_event: Optional["torch.cuda.Event"] = None
+    aux_streams: Optional[Tuple["torch.cuda.Stream", ...]] = None
+
+
+TRTCudaGraphCacheKey = Tuple[
+    Tuple[int, ...], torch.dtype, torch.device, Optional[int]
+]
+
+
+_TRT_USE_USER_AUX_STREAMS_ENV_NAME = "INFERENCE_MODELS_TRT_USE_USER_AUX_STREAMS"
 
 
 class TRTCudaGraphCache:
@@ -118,7 +128,7 @@ class TRTCudaGraphCache:
 
     def __init__(self, capacity: int):
         self._cache: OrderedDict[
-            Tuple[Tuple[int, ...], torch.dtype, torch.device], TRTCudaGraphState
+            TRTCudaGraphCacheKey, TRTCudaGraphState
         ] = OrderedDict()
         self._capacity = capacity
         self._state_lock = threading.RLock()
@@ -137,7 +147,7 @@ class TRTCudaGraphCache:
         with self._state_lock:
             return len(self._cache)
 
-    def list_keys(self) -> List[Tuple[Tuple[int, ...], torch.dtype, torch.device]]:
+    def list_keys(self) -> List[TRTCudaGraphCacheKey]:
         """Return a list of all keys currently in the cache.
 
         Each key is a ``(shape, dtype, device)`` tuple representing a cached
@@ -157,7 +167,7 @@ class TRTCudaGraphCache:
             return list(self._cache.keys())
 
     def safe_remove(
-        self, key: Tuple[Tuple[int, ...], torch.dtype, torch.device]
+        self, key: TRTCudaGraphCacheKey
     ) -> None:
         """Remove a single entry from the cache by its key.
 
@@ -237,13 +247,13 @@ class TRTCudaGraphCache:
             torch.cuda.empty_cache()
 
     def __contains__(
-        self, key: Tuple[Tuple[int, ...], torch.dtype, torch.device]
+        self, key: TRTCudaGraphCacheKey
     ) -> bool:
         with self._state_lock:
             return key in self._cache
 
     def __getitem__(
-        self, key: Tuple[Tuple[int, ...], torch.dtype, torch.device]
+        self, key: TRTCudaGraphCacheKey
     ) -> TRTCudaGraphState:
         with self._state_lock:
             value = self._cache[key]
@@ -252,7 +262,7 @@ class TRTCudaGraphCache:
 
     def __setitem__(
         self,
-        key: Tuple[Tuple[int, ...], torch.dtype, torch.device],
+        key: TRTCudaGraphCacheKey,
         value: TRTCudaGraphState,
     ):
         with self._state_lock:
@@ -267,8 +277,37 @@ class TRTCudaGraphCache:
         del evicted.input_buffer
         del evicted.output_buffers
         del evicted.execution_context
+        del evicted.aux_streams
         if empty_cuda_cache:
             torch.cuda.empty_cache()
+
+
+def _use_trt_user_aux_streams() -> bool:
+    return get_boolean_from_env(
+        variable_name=_TRT_USE_USER_AUX_STREAMS_ENV_NAME,
+        default=False,
+    )
+
+
+def create_trt_user_aux_streams(
+    engine: trt.ICudaEngine,
+    device: torch.device,
+) -> Optional[Tuple[torch.cuda.Stream, ...]]:
+    if not _use_trt_user_aux_streams():
+        return None
+    num_aux_streams = max(int(getattr(engine, "num_aux_streams", 0)), 0)
+    if num_aux_streams == 0:
+        return None
+    return tuple(torch.cuda.Stream(device=device) for _ in range(num_aux_streams))
+
+
+def bind_trt_aux_streams(
+    context: trt.IExecutionContext,
+    aux_streams: Optional[Tuple[torch.cuda.Stream, ...]],
+) -> None:
+    if aux_streams is None or len(aux_streams) == 0:
+        return
+    context.set_aux_streams([int(stream.cuda_stream) for stream in aux_streams])
 
 
 def establish_trt_cuda_graph_cache(
@@ -361,6 +400,57 @@ def establish_trt_cuda_graph_cache(
     if not auto_cuda_graphs_enabled:
         return None
     return TRTCudaGraphCache(capacity=default_cuda_graph_cache_size)
+
+
+TRTModelResults = Union[torch.Tensor, Tuple[torch.Tensor, ...], List[torch.Tensor]]
+
+
+def _as_trt_result_tensors(model_results: TRTModelResults) -> List[torch.Tensor]:
+    if isinstance(model_results, torch.Tensor):
+        return [model_results]
+    return list(model_results)
+
+
+def _get_preproc_done_event(
+    pre_processed_images: torch.Tensor,
+) -> Optional[torch.cuda.Event]:
+    return getattr(pre_processed_images, "_trt_preproc_done_event", None)
+
+
+def prepare_trt_results_for_consumer(
+    model_results: TRTModelResults,
+    consumer_stream: torch.cuda.Stream,
+) -> None:
+    """Attach cross-stream synchronization for TRT outputs consumed elsewhere."""
+    result_tensors = _as_trt_result_tensors(model_results)
+    if not result_tensors:
+        return
+    produce_event = getattr(result_tensors[0], "_trt_produce_event", None)
+    if produce_event is not None:
+        consumer_stream.wait_event(produce_event)
+    graph_state = getattr(result_tensors[0], "_trt_graph_state", None)
+    if graph_state is not None:
+        graph_state.consumer_done_event = torch.cuda.Event()
+    for result_tensor in result_tensors:
+        result_tensor.record_stream(consumer_stream)
+
+
+def mark_trt_results_consumed(
+    model_results: TRTModelResults,
+    consumer_stream: torch.cuda.Stream,
+) -> None:
+    """Signal that the consumer stream has finished using zero-copy TRT buffers."""
+    result_tensors = _as_trt_result_tensors(model_results)
+    if not result_tensors:
+        return
+    graph_state = getattr(result_tensors[0], "_trt_graph_state", None)
+    if graph_state is None:
+        return
+    consumer_done_event = graph_state.consumer_done_event
+    if consumer_done_event is None:
+        consumer_done_event = torch.cuda.Event()
+        graph_state.consumer_done_event = consumer_done_event
+    consumer_done_event.record(consumer_stream)
 
 
 def get_trt_engine_inputs_and_outputs(
@@ -559,7 +649,12 @@ def infer_from_trt_engine(
     """
     if stream is None:
         stream = torch.cuda.current_stream(device)
-    with torch.cuda.stream(stream):
+    prev_stream = torch.cuda.current_stream(device)
+    torch.cuda.set_stream(stream)
+    try:
+        preproc_done_event = _get_preproc_done_event(pre_processed_images)
+        if preproc_done_event is not None:
+            stream.wait_event(preproc_done_event)
         pre_processed_images.record_stream(stream)
         results = _infer_from_trt_engine(
             pre_processed_images=pre_processed_images,
@@ -571,7 +666,16 @@ def infer_from_trt_engine(
             outputs=outputs,
             trt_cuda_graph_cache=trt_cuda_graph_cache,
         )
-    stream.synchronize()
+    finally:
+        torch.cuda.set_stream(prev_stream)
+    graph_state = getattr(results[0], "_trt_graph_state", None)
+    if graph_state is None:
+        if trt_cuda_graph_cache is None:
+            stream.synchronize()
+        return results
+    produce_event = torch.cuda.Event()
+    produce_event.record(graph_state.cuda_stream)
+    results[0]._trt_produce_event = produce_event
     return results
 
 
@@ -687,7 +791,14 @@ def _execute_trt_engine(
     if trt_cuda_graph_cache is not None:
         input_shape = tuple(pre_processed_images.shape)
         input_dtype = pre_processed_images.dtype
-        cache_key = (input_shape, input_dtype, device)
+        reuse_key = getattr(pre_processed_images, "_trt_reuse_key", None)
+        cache_key = (input_shape, input_dtype, device, reuse_key)
+        zero_copy_consumer = bool(
+            getattr(pre_processed_images, "_trt_zero_copy_consumer", False)
+        )
+        reuse_input = bool(
+            getattr(pre_processed_images, "_trt_reuse_as_input_buffer", False)
+        )
 
         if cache_key not in trt_cuda_graph_cache:
             LOGGER.debug("Capturing CUDA graph for shape %s", input_shape)
@@ -698,6 +809,7 @@ def _execute_trt_engine(
                 device=device,
                 input_name=input_name,
                 outputs=outputs,
+                use_pre_processed_images_as_input_buffer=reuse_input,
             )
             trt_cuda_graph_cache[cache_key] = trt_cuda_graph
             return results
@@ -705,11 +817,34 @@ def _execute_trt_engine(
         else:
             trt_cuda_graph_state = trt_cuda_graph_cache[cache_key]
             stream = trt_cuda_graph_state.cuda_stream
+            preproc_done_event = _get_preproc_done_event(pre_processed_images)
+            if preproc_done_event is not None:
+                stream.wait_event(preproc_done_event)
+            if not zero_copy_consumer:
+                with torch.cuda.stream(stream):
+                    if (
+                        trt_cuda_graph_state.input_buffer.data_ptr()
+                        != pre_processed_images.data_ptr()
+                    ):
+                        trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
+                    trt_cuda_graph_state.cuda_graph.replay()
+                    results = [
+                        buf.clone() for buf in trt_cuda_graph_state.output_buffers
+                    ]
+                stream.synchronize()
+                return results
+            consumer_done = trt_cuda_graph_state.consumer_done_event
+            if consumer_done is not None:
+                consumer_done.wait(stream)
             with torch.cuda.stream(stream):
-                trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
+                if (
+                    trt_cuda_graph_state.input_buffer.data_ptr()
+                    != pre_processed_images.data_ptr()
+                ):
+                    trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
                 trt_cuda_graph_state.cuda_graph.replay()
-                results = [buf.clone() for buf in trt_cuda_graph_state.output_buffers]
-            stream.synchronize()
+            results = list(trt_cuda_graph_state.output_buffers)
+            results[0]._trt_graph_state = trt_cuda_graph_state
             return results
 
     else:
@@ -752,14 +887,18 @@ def _capture_cuda_graph(
     device: torch.device,
     input_name: str,
     outputs: List[str],
+    use_pre_processed_images_as_input_buffer: bool = False,
 ) -> Tuple[List[torch.Tensor], TRTCudaGraphState]:
     # Each CUDA graph needs its own execution context. Sharing a single context
     # across graphs for different input shapes causes TRT to reallocate internal
     # workspace buffers, invalidating GPU addresses baked into earlier graphs.
     graph_context = engine.create_execution_context()
 
-    input_buffer = torch.empty_like(pre_processed_images, device=device)
-    input_buffer.copy_(pre_processed_images)
+    if use_pre_processed_images_as_input_buffer:
+        input_buffer = pre_processed_images
+    else:
+        input_buffer = torch.empty_like(pre_processed_images, device=device)
+        input_buffer.copy_(pre_processed_images)
 
     status = graph_context.set_input_shape(
         input_name, tuple(pre_processed_images.shape)
@@ -789,7 +928,12 @@ def _capture_cuda_graph(
         output_buffers.append(output_buffer)
 
     stream = torch.cuda.Stream(device=device)
+    aux_streams = create_trt_user_aux_streams(engine=engine, device=device)
+    preproc_done_event = _get_preproc_done_event(pre_processed_images)
+    if preproc_done_event is not None:
+        stream.wait_event(preproc_done_event)
     with torch.cuda.stream(stream):
+        bind_trt_aux_streams(context=graph_context, aux_streams=aux_streams)
         status = graph_context.execute_async_v3(stream_handle=stream.cuda_stream)
         if not status:
             raise ModelRuntimeError(
@@ -800,6 +944,7 @@ def _capture_cuda_graph(
 
     cuda_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(cuda_graph, stream=stream):
+        bind_trt_aux_streams(context=graph_context, aux_streams=aux_streams)
         status = graph_context.execute_async_v3(stream_handle=stream.cuda_stream)
         if not status:
             raise ModelRuntimeError(
@@ -822,6 +967,7 @@ def _capture_cuda_graph(
         input_buffer=input_buffer,
         output_buffers=output_buffers,
         execution_context=graph_context,
+        aux_streams=aux_streams,
     )
 
     return results, trt_cuda_graph_state

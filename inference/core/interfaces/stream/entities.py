@@ -23,6 +23,12 @@ ObjectDetectionPrediction = dict
 
 
 @dataclass(frozen=True)
+class InferenceHandlerResult:
+    predictions: List[AnyPrediction]
+    video_frames: Optional[List[VideoFrame]] = None
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     class_agnostic_nms: Optional[bool]
     confidence: Optional[float]
@@ -121,7 +127,10 @@ class PipelineStateReport:
     sources_metadata: List[SourceMetadata]
 
 
-InferenceHandler = Callable[[List[VideoFrame]], List[AnyPrediction]]
+InferenceHandler = Callable[
+    [List[VideoFrame]],
+    Optional[Union[List[AnyPrediction], InferenceHandlerResult]],
+]
 SinkHandler = Optional[
     Union[
         Callable[[AnyPrediction, VideoFrame], None],
