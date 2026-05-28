@@ -1,5 +1,15 @@
 # Changelog
 
+## `0.29.0`
+
+### Added
+
+- Optional Triton full post-processing fast path for RF-DETR instance
+  segmentation behind `RFDETR_TRITON_POSTPROC`, with parity coverage for
+  dense and RLE outputs on CUDA-backed RF-DETR backends.
+
+---
+
 ## `0.28.1`
 
 ### Fixed

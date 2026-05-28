@@ -24,6 +24,10 @@ from inference_models.models.common.roboflow.post_processing import (
     run_nms_for_key_points_detection,
     run_nms_for_object_detection,
 )
+from inference_models.models.rfdetr.triton_fullpostproc import (
+    get_rfdetr_triton_postproc_geometry,
+    rfdetr_triton_postproc_geometry_supported,
+)
 from inference_models.weights_providers.entities import RecommendedParameters
 
 
@@ -105,6 +109,60 @@ class TestPostProcessNmsFused:
         result = post_process_nms_fused_model_output(out, conf_thresh=thresholds)
         kept = sorted(int(c) for c in result[0][:, 5].tolist())
         assert kept == [1, 2]
+
+
+class TestRFDETRTritonPostProcessingGeometry:
+    def test_geometry_calculates_mask_window(self) -> None:
+        geometry = get_rfdetr_triton_postproc_geometry(
+            denorm_size_wh=(640, 480),
+            pad_ltrb=(32, 24, 32, 24),
+            scale_wh=(2.0, 2.0),
+            orig_size_wh=(320, 240),
+            size_after_pre_processing_wh=(320, 240),
+            static_crop_offset_xy=(0, 0),
+            mask_size_hw=(78, 78),
+        )
+
+        assert geometry.denorm_w == 640
+        assert geometry.denorm_h == 480
+        assert geometry.orig_w == 320
+        assert geometry.orig_h == 240
+        assert geometry.pad_left == 32
+        assert geometry.pad_top == 24
+        assert geometry.inv_scale_w == pytest.approx(0.5)
+        assert geometry.inv_scale_h == pytest.approx(0.5)
+        assert geometry.mask_offset_x == 4
+        assert geometry.mask_offset_y == 4
+        assert geometry.mask_input_w == 70
+        assert geometry.mask_input_h == 70
+
+    def test_supported_rejects_empty_mask_window(self) -> None:
+        assert (
+            rfdetr_triton_postproc_geometry_supported(
+                denorm_size_wh=(8, 8),
+                pad_ltrb=(4, 0, 4, 0),
+                scale_wh=(1.0, 1.0),
+                orig_size_wh=(8, 8),
+                size_after_pre_processing_wh=(8, 8),
+                static_crop_offset_xy=(0, 0),
+                mask_size_hw=(4, 4),
+            )
+            is False
+        )
+
+    def test_supported_rejects_invalid_crop_window(self) -> None:
+        assert (
+            rfdetr_triton_postproc_geometry_supported(
+                denorm_size_wh=(640, 640),
+                pad_ltrb=(0, 0, 0, 0),
+                scale_wh=(1.0, 1.0),
+                orig_size_wh=(100, 100),
+                size_after_pre_processing_wh=(90, 90),
+                static_crop_offset_xy=(20, 20),
+                mask_size_hw=(78, 78),
+            )
+            is False
+        )
 
 
 def _is_output(box_class_conf, num_mask_coeffs=32):

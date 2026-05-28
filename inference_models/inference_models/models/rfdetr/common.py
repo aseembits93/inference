@@ -10,6 +10,7 @@ from inference_models.models.common.roboflow.model_packages import (
     PreProcessingMetadata,
     StaticCropOffset,
 )
+from inference_models.models.common.rle_utils import LazyInstancesRLEMasks
 from inference_models.models.common.roboflow.post_processing import (
     align_instance_segmentation_results,
     align_instance_segmentation_results_to_rle_masks,
@@ -18,6 +19,90 @@ from inference_models.models.common.roboflow.post_processing import (
 from inference_models.models.rfdetr.class_remapping import ClassesReMapping
 from inference_models.models.rfdetr.post_processor import select_topk_predictions
 from inference_models.utils.file_system import read_json
+from inference_models.configuration import RFDETR_TRITON_POSTPROC
+
+if RFDETR_TRITON_POSTPROC:
+    try:
+        from inference_models.models.rfdetr.triton_fullpostproc import (
+            TRITON_AVAILABLE as _TRITON_POSTPROC_AVAILABLE,
+            rfdetr_triton_postproc,
+            rfdetr_triton_postproc_geometry_supported,
+        )
+
+        _TRITON_POSTPROC_READY = (
+            _TRITON_POSTPROC_AVAILABLE and torch.cuda.is_available()
+        )
+    except Exception:
+        _TRITON_POSTPROC_READY = False
+        rfdetr_triton_postproc = None
+        rfdetr_triton_postproc_geometry_supported = None
+else:
+    _TRITON_POSTPROC_READY = False
+    rfdetr_triton_postproc = None
+    rfdetr_triton_postproc_geometry_supported = None
+
+
+def post_triton_eligible(
+    bboxes: torch.Tensor,
+    logits: torch.Tensor,
+    masks: torch.Tensor,
+    pre_processing_meta: List[PreProcessingMetadata],
+    classes_re_mapping: Optional[ClassesReMapping],
+) -> bool:
+    if not _TRITON_POSTPROC_READY:
+        return False
+    if bboxes.ndim != 3 or logits.ndim != 3 or masks.ndim != 4:
+        return False
+    if not bboxes.is_cuda or not logits.is_cuda or not masks.is_cuda:
+        return False
+    if bboxes.device != logits.device or bboxes.device != masks.device:
+        return False
+    if (
+        bboxes.shape[0] != 1
+        or logits.shape[0] != 1
+        or masks.shape[0] != 1
+        or len(pre_processing_meta) != 1
+    ):
+        return False
+    if bboxes.shape[2] != 4:
+        return False
+    num_queries = bboxes.shape[1]
+    num_classes_total = logits.shape[2]
+    mask_h = masks.shape[2]
+    mask_w = masks.shape[3]
+    if (
+        num_queries <= 0
+        or num_classes_total <= 0
+        or mask_h <= 0
+        or mask_w <= 0
+        or logits.shape[1] != num_queries
+        or masks.shape[1] != num_queries
+    ):
+        return False
+    meta = pre_processing_meta[0]
+    if rfdetr_triton_postproc_geometry_supported is None:
+        return False
+    denorm_size = meta.nonsquare_intermediate_size or meta.inference_size
+    return rfdetr_triton_postproc_geometry_supported(
+        denorm_size_wh=(denorm_size.width, denorm_size.height),
+        pad_ltrb=(
+            meta.pad_left,
+            meta.pad_top,
+            meta.pad_right,
+            meta.pad_bottom,
+        ),
+        scale_wh=(meta.scale_width, meta.scale_height),
+        orig_size_wh=(meta.original_size.width, meta.original_size.height),
+        size_after_pre_processing_wh=(
+            meta.size_after_pre_processing.width,
+            meta.size_after_pre_processing.height,
+        ),
+        static_crop_offset_xy=(
+            meta.static_crop_offset.offset_x,
+            meta.static_crop_offset.offset_y,
+        ),
+        mask_size_hw=(mask_h, mask_w),
+    )
 
 
 def parse_model_type(config_path: str) -> str:
@@ -132,6 +217,56 @@ def post_process_instance_segmentation_results(
     num_classes: int,
     classes_re_mapping: Optional[ClassesReMapping],
 ) -> List[InstanceDetections]:
+    if post_triton_eligible(
+        bboxes, logits, masks, pre_processing_meta, classes_re_mapping
+    ):
+        meta = pre_processing_meta[0]
+        denorm_size = meta.nonsquare_intermediate_size or meta.inference_size
+        thr_arg = threshold if isinstance(threshold, torch.Tensor) else float(threshold)
+        combined, mask_bin, counter, done_event, _, _ = rfdetr_triton_postproc(
+            bboxes=bboxes,
+            logits=logits,
+            masks=masks,
+            threshold=thr_arg,
+            num_classes=num_classes,
+            class_mapping=(
+                classes_re_mapping.class_mapping
+                if classes_re_mapping is not None
+                else None
+            ),
+            denorm_size_wh=(denorm_size.width, denorm_size.height),
+            pad_ltrb=(
+                meta.pad_left,
+                meta.pad_top,
+                meta.pad_right,
+                meta.pad_bottom,
+            ),
+            scale_wh=(meta.scale_width, meta.scale_height),
+            orig_size_wh=(meta.original_size.width, meta.original_size.height),
+            size_after_pre_processing_wh=(
+                meta.size_after_pre_processing.width,
+                meta.size_after_pre_processing.height,
+            ),
+            static_crop_offset_xy=(
+                meta.static_crop_offset.offset_x,
+                meta.static_crop_offset.offset_y,
+            ),
+        )
+        done_event.wait(torch.cuda.current_stream(bboxes.device))
+        n_survivors = int(counter.item())
+        combined_slice = combined[:n_survivors]
+        mask_gpu = mask_bin[:n_survivors].view(torch.bool)
+        detections = InstanceDetections(
+            xyxy=combined_slice[:, :4],
+            confidence=combined_slice[:, 4].view(torch.float32),
+            class_id=combined_slice[:, 5],
+            mask=mask_gpu,
+        )
+        detections.__dict__["_combined_gpu"] = combined
+        detections.__dict__["_mask_gpu"] = mask_gpu
+        detections.__dict__["_counter_gpu"] = counter
+        detections.__dict__["_postproc_done_event"] = done_event
+        return [detections]
     logits_sigmoid = torch.nn.functional.sigmoid(logits)
     results = []
     device = bboxes.device
@@ -226,7 +361,121 @@ def post_process_instance_segmentation_results_to_rle_masks(
     threshold: Union[float, torch.Tensor],
     num_classes: int,
     classes_re_mapping: Optional[ClassesReMapping],
+    emit_in_kernel_rle: bool = False,
+    defer_count_to_adapter: bool = False,
 ) -> List[InstanceDetections]:
+    if post_triton_eligible(
+        bboxes, logits, masks, pre_processing_meta, classes_re_mapping
+    ):
+        meta = pre_processing_meta[0]
+        denorm_size = meta.nonsquare_intermediate_size or meta.inference_size
+        thr_arg = threshold if isinstance(threshold, torch.Tensor) else float(threshold)
+        combined, mask_bin, counter, done_event, rle_counts, rle_lengths = (
+            rfdetr_triton_postproc(
+                bboxes=bboxes,
+                logits=logits,
+                masks=masks,
+                threshold=thr_arg,
+                num_classes=num_classes,
+                class_mapping=(
+                    classes_re_mapping.class_mapping
+                    if classes_re_mapping is not None
+                    else None
+                ),
+                denorm_size_wh=(denorm_size.width, denorm_size.height),
+                pad_ltrb=(
+                    meta.pad_left,
+                    meta.pad_top,
+                    meta.pad_right,
+                    meta.pad_bottom,
+                ),
+                scale_wh=(meta.scale_width, meta.scale_height),
+                orig_size_wh=(meta.original_size.width, meta.original_size.height),
+                size_after_pre_processing_wh=(
+                    meta.size_after_pre_processing.width,
+                    meta.size_after_pre_processing.height,
+                ),
+                static_crop_offset_xy=(
+                    meta.static_crop_offset.offset_x,
+                    meta.static_crop_offset.offset_y,
+                ),
+                emit_rle=emit_in_kernel_rle,
+                pack_dense_masks=defer_count_to_adapter and not emit_in_kernel_rle,
+            )
+        )
+        done_event.wait(torch.cuda.current_stream(bboxes.device))
+        orig_h = meta.original_size.height
+        orig_w = meta.original_size.width
+        if defer_count_to_adapter and not emit_in_kernel_rle:
+            empty_xyxy = torch.empty((0, 4), dtype=torch.int32, device=bboxes.device)
+            empty_conf = torch.empty((0,), dtype=torch.float32, device=bboxes.device)
+            empty_cls = torch.empty((0,), dtype=torch.int32, device=bboxes.device)
+            detections = InstanceDetections(
+                xyxy=empty_xyxy,
+                confidence=empty_conf,
+                class_id=empty_cls,
+                mask=LazyInstancesRLEMasks(
+                    image_size=(orig_h, orig_w),
+                    mask_packed_gpu=mask_bin,
+                    mask_packed_width=orig_w,
+                    done_event=done_event,
+                ),
+            )
+            detections.__dict__["_combined_gpu"] = combined
+            detections.__dict__["_mask_packed_gpu"] = mask_bin
+            detections.__dict__["_defer_count_to_adapter"] = True
+            detections.__dict__["_postproc_done_event"] = done_event
+            return [detections]
+
+        n_survivors = int(counter.item())
+        if n_survivors == 0:
+            empty_xyxy = torch.empty((0, 4), dtype=torch.int32, device=bboxes.device)
+            empty_conf = torch.empty((0,), dtype=torch.float32, device=bboxes.device)
+            empty_cls = torch.empty((0,), dtype=torch.int32, device=bboxes.device)
+            return [
+                InstanceDetections(
+                    xyxy=empty_xyxy,
+                    confidence=empty_conf,
+                    class_id=empty_cls,
+                    mask=InstancesRLEMasks.from_coco_rle_masks(
+                        image_size=(orig_h, orig_w), masks=[]
+                    ),
+                )
+            ]
+        combined_slice = combined[:n_survivors]
+        instances_masks = LazyInstancesRLEMasks(
+            image_size=(orig_h, orig_w),
+            mask_gpu=(
+                mask_bin[:n_survivors].view(torch.bool)
+                if not emit_in_kernel_rle
+                else None
+            ),
+            rle_counts_gpu=(
+                rle_counts[:n_survivors]
+                if emit_in_kernel_rle and rle_counts is not None
+                else None
+            ),
+            rle_lengths_gpu=(
+                rle_lengths[:n_survivors]
+                if emit_in_kernel_rle and rle_lengths is not None
+                else None
+            ),
+            done_event=done_event,
+        )
+        xyxy = combined_slice[:, :4]
+        confidence = combined_slice[:, 4].view(torch.float32)
+        class_id = combined_slice[:, 5]
+        detections = InstanceDetections(
+            xyxy=xyxy,
+            confidence=confidence,
+            class_id=class_id,
+            mask=instances_masks,
+        )
+        if not emit_in_kernel_rle:
+            detections.__dict__["_combined_gpu"] = combined_slice
+            detections.__dict__["_mask_gpu"] = mask_bin[:n_survivors].view(torch.bool)
+            detections.__dict__["_postproc_done_event"] = done_event
+        return [detections]
     logits_sigmoid = torch.nn.functional.sigmoid(logits)
     final_results = []
     device = bboxes.device
