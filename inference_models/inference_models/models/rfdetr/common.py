@@ -1,13 +1,12 @@
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torchvision.transforms import functional
 
-from inference_models import Detections, InstanceDetections, InstancesRLEMasks
+from inference_models import Detections, InstanceDetections, InstancesRLEMasks, KeyPoints
 from inference_models.configuration import (
     INFERENCE_MODELS_RFDETR_TRITON_POSTPROC_ENABLED,
 )
-from inference_models import Detections, InstanceDetections, InstancesRLEMasks, KeyPoints
 from inference_models.entities import ImageDimensions
 from inference_models.errors import CorruptedModelPackageError
 from inference_models.models.common.roboflow.model_packages import (
@@ -410,28 +409,6 @@ def post_process_instance_segmentation_results_to_rle_masks(
             pre_processing_meta,
         )
     ]
-        if len(aligned_boxes) > 0:
-            aligned_boxes_tensor = torch.stack(aligned_boxes, dim=0)
-            final_results.append(
-                InstanceDetections(
-                    xyxy=aligned_boxes_tensor.round().int(),
-                    confidence=confidence,
-                    class_id=top_classes.int(),
-                    mask=instances_masks,
-                )
-            )
-        else:
-            final_results.append(
-                InstanceDetections(
-                    xyxy=torch.empty(
-                        (0, 4), dtype=torch.int32, device=image_bboxes.device
-                    ),
-                    class_id=top_classes.int(),
-                    confidence=confidence,
-                    mask=instances_masks,
-                )
-            )
-    return final_results
 
 
 def cxcywh_to_xyxy(boxes):
