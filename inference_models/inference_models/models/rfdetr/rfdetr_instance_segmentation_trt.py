@@ -52,6 +52,9 @@ from inference_models.models.rfdetr.common import (
     post_process_instance_segmentation_results_to_rle_masks,
 )
 from inference_models.models.rfdetr.pre_processing import pre_process_network_input
+from inference_models.models.rfdetr.triton_preprocess_runtime import (
+    FastPreprocessRuntime,
+)
 from inference_models.weights_providers.entities import RecommendedParameters
 
 try:
@@ -218,8 +221,10 @@ class RFDetrForInstanceSegmentationTRT(
         self._trt_cuda_graph_cache = trt_cuda_graph_cache
         self._lock = threading.Lock()
         self._inference_stream = torch.cuda.Stream(device=self._device)
+        self._pre_process_cuda_stream = torch.cuda.Stream(device=self._device)
         self._thread_local_storage = threading.local()
         self.recommended_parameters = recommended_parameters
+        self._fast_preprocess_runtime = FastPreprocessRuntime(device=self._device)
 
     @property
     def class_names(self) -> List[str]:
@@ -237,6 +242,17 @@ class RFDetrForInstanceSegmentationTRT(
         pre_processing_overrides: Optional[PreProcessingOverrides] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, List[PreProcessingMetadata]]:
+        fast = self._fast_preprocess_runtime.try_preprocess(
+            images=images,
+            input_color_format=input_color_format,
+            image_size=image_size,
+            image_pre_processing=self._inference_config.image_pre_processing,
+            network_input=self._inference_config.network_input,
+            stream=self._pre_process_stream,
+        )
+        if fast is not None:
+            self._fast_preproc_event = fast.ready_event
+            return fast.tensor, fast.metadata
         with torch.cuda.stream(self._pre_process_stream):
             pre_processed_images, pre_processing_meta = pre_process_network_input(
                 images=images,
@@ -248,6 +264,7 @@ class RFDetrForInstanceSegmentationTRT(
                 pre_processing_overrides=pre_processing_overrides,
             )
         self._pre_process_stream.synchronize()
+        pre_processed_images._pre_processing_meta = pre_processing_meta  # type: ignore[attr-defined]
         return pre_processed_images, pre_processing_meta
 
     def forward(
@@ -257,6 +274,10 @@ class RFDetrForInstanceSegmentationTRT(
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cache = self._trt_cuda_graph_cache if not disable_cuda_graphs else None
+        preproc_event = getattr(self, "_fast_preproc_event", None)
+        if preproc_event is not None:
+            self._inference_stream.wait_event(preproc_event)
+            self._fast_preproc_event = None
         with self._lock:
             with use_cuda_context(context=self._cuda_context):
                 detections, labels, masks = infer_from_trt_engine(
@@ -324,11 +345,7 @@ class RFDetrForInstanceSegmentationTRT(
 
     @property
     def _pre_process_stream(self) -> torch.cuda.Stream:
-        if not hasattr(self._thread_local_storage, "pre_process_stream"):
-            self._thread_local_storage.pre_process_stream = torch.cuda.Stream(
-                device=self._device
-            )
-        return self._thread_local_storage.pre_process_stream
+        return self._pre_process_cuda_stream
 
     @property
     def _post_process_stream(self) -> torch.cuda.Stream:
