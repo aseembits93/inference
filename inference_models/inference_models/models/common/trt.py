@@ -732,7 +732,21 @@ def _execute_trt_engine(
                     != pre_processed_images.data_ptr()
                 ):
                     trt_cuda_graph_state.input_buffer.copy_(pre_processed_images)
+                    input_consumed_event = torch.cuda.Event()
+                    input_consumed_event.record(stream)
+                    pre_processed_images._trt_consumed_event = (  # type: ignore[attr-defined]
+                        input_consumed_event
+                    )
                 trt_cuda_graph_state.cuda_graph.replay()
+                if (
+                    trt_cuda_graph_state.input_buffer.data_ptr()
+                    == pre_processed_images.data_ptr()
+                ):
+                    input_consumed_event = torch.cuda.Event()
+                    input_consumed_event.record(stream)
+                    pre_processed_images._trt_consumed_event = (  # type: ignore[attr-defined]
+                        input_consumed_event
+                    )
                 if synchronize:
                     results = [
                         buf.clone() for buf in trt_cuda_graph_state.output_buffers
