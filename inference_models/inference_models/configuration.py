@@ -343,6 +343,10 @@ def get_rfdetr_pipeline_depth() -> int:
 
 
 RFDETR_PIPELINE_DEPTH = get_rfdetr_pipeline_depth()
+INFERENCE_MODELS_RFDETR_DEFAULT_KEY_POINTS_THRESHOLD = get_float_from_env(
+    variable_name="INFERENCE_MODELS_DETR_DEFAULT_KEY_POINTS_THRESHOLD",
+    default=0.3,
+)
 INFERENCE_MODELS_ROBOFLOW_INSTANT_DEFAULT_CONFIDENCE = get_float_from_env(
     variable_name="INFERENCE_MODELS_ROBOFLOW_INSTANT_DEFAULT_CONFIDENCE",
     default=0.99,
