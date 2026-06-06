@@ -30,6 +30,9 @@ import torch
 import torch.nn.functional as F
 from pycocotools import mask as mask_utils
 
+from inference_models.models.base.async_handoff import (
+    attach_deferred_postprocess_handoff,
+)
 from inference_models.models.base.instance_segmentation import InstanceDetections
 from inference_models.models.base.types import InstancesRLEMasks
 from inference_models.models.common.roboflow.model_packages import PreProcessingMetadata
@@ -61,6 +64,10 @@ _SPARSE_TOPK_MAX_TOTAL_RUNS = _SPARSE_MAX_TOTAL_RUNS * _SPARSE_MAX_CLASSES_PER_Q
 _MAX_INTERPOLATION_WEIGHT_CACHE_ENTRIES = 16
 _INTERPOLATION_WEIGHT_CACHE = OrderedDict()
 _INTERPOLATION_WEIGHT_CACHE_LOCK = Lock()
+_MAX_PINNED_HOST_POOL_BUFFERS = 8
+_PINNED_HOST_POOL = OrderedDict()
+_PINNED_HOST_POOL_LOCK = Lock()
+_PINNED_HOST_POOL_SIZE = 0
 
 
 def _get_interpolation_weights(
@@ -156,6 +163,34 @@ def _interpolation_cache_key(
     )
 
 
+def _acquire_pinned_host_buffer(source: torch.Tensor) -> torch.Tensor:
+    """Return a pinned CPU tensor matching ``source`` for async DtoH copies."""
+    global _PINNED_HOST_POOL_SIZE
+    key = (tuple(source.shape), source.dtype)
+    with _PINNED_HOST_POOL_LOCK:
+        buffers = _PINNED_HOST_POOL.get(key)
+        if buffers:
+            _PINNED_HOST_POOL.move_to_end(key)
+            _PINNED_HOST_POOL_SIZE -= 1
+            return buffers.pop()
+    # Pinned memory is required for ``non_blocking=True`` GPU-to-CPU copies to
+    # overlap with later GPU work; allocating it per frame is expensive.
+    return torch.empty(key[0], dtype=key[1], pin_memory=True)
+
+
+def _release_pinned_host_buffer(buffer: torch.Tensor) -> None:
+    """Return a pinned host buffer to the bounded shape/dtype reuse pool."""
+    global _PINNED_HOST_POOL_SIZE
+    key = (tuple(buffer.shape), buffer.dtype)
+    with _PINNED_HOST_POOL_LOCK:
+        if _PINNED_HOST_POOL_SIZE >= _MAX_PINNED_HOST_POOL_BUFFERS:
+            return
+        buffers = _PINNED_HOST_POOL.setdefault(key, [])
+        buffers.append(buffer)
+        _PINNED_HOST_POOL.move_to_end(key)
+        _PINNED_HOST_POOL_SIZE += 1
+
+
 def post_process_single_instance_segmentation_result_to_rle_masks_triton(
     image_bboxes: torch.Tensor,
     image_scores: torch.Tensor,
@@ -163,6 +198,7 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
     image_meta: PreProcessingMetadata,
     threshold: Union[float, torch.Tensor],
     classes_re_mapping: Optional[ClassesReMapping],
+    defer_postprocess_sync: bool = False,
 ) -> Optional[InstanceDetections]:
     """Run the sparse Triton RF-DETR RLE postprocess path for one image.
 
@@ -174,6 +210,11 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
     than one class above threshold, the first pass asks for a retry and the
     second pass emits up to ``_SPARSE_MAX_CLASSES_PER_QUERY`` query-class
     candidates per query.
+
+    When ``defer_postprocess_sync`` is set, the function enqueues the metadata,
+    sparse RLE, and DtoH copies, then returns a placeholder whose finalizer does
+    CPU assembly later. That is used by the streaming pipeline to keep the next
+    frame's GPU work moving while Python handles previous detections.
     """
     unsupported_reason = _unsupported_triton_postprocess_reason(
         image_bboxes=image_bboxes,
@@ -215,6 +256,94 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
         device=image_masks.device,
         axis="width",
     )
+
+    if defer_postprocess_sync:
+        # Deferred pipeline mode separates class metadata from query mask RLE:
+        # every class candidate can reuse the one sparse mask generated for its
+        # source query, so GPU work remains bounded by the number of queries.
+        topk_metadata_rows = num_queries * _SPARSE_MAX_CLASSES_PER_QUERY
+        query_metadata = torch.empty(
+            (num_queries, _HEADER_SIZE),
+            dtype=torch.float32,
+            device=image_scores.device,
+        )
+        class_metadata = torch.empty(
+            (topk_metadata_rows, _HEADER_SIZE),
+            dtype=torch.float32,
+            device=image_scores.device,
+        )
+        records = torch.empty(
+            (_SPARSE_MAX_TOTAL_RUNS + 1, 3),
+            dtype=torch.int32,
+            device=image_scores.device,
+        )
+        _select_topk_query_class_metadata_kernel[(num_queries,)](
+            image_scores,
+            image_bboxes,
+            class_mapping,
+            class_metadata,
+            query_metadata,
+            records,
+            confidence_threshold,
+            num_queries,
+            num_classes,
+            class_mapping.shape[0],
+            output_height,
+            output_width,
+            BLOCK_CLASSES=triton.next_power_of_2(num_classes),
+            METADATA_STRIDE=_HEADER_SIZE,
+            MAX_CLASSES_PER_QUERY=_SPARSE_MAX_CLASSES_PER_QUERY,
+            FLAG_WRITE_QUERY_METADATA=True,
+            FLAG_OVERFLOW_CLASSES=False,
+        )
+        _sparse_atomic_rle_from_metadata_kernel[
+            (num_queries, triton.cdiv(_SPARSE_MAX_ROI_WIDTH, _SPARSE_BLOCK_COLS))
+        ](
+            image_masks,
+            y_idx,
+            y_weight,
+            x_idx,
+            x_weight,
+            query_metadata,
+            records,
+            num_queries,
+            mask_height,
+            mask_width,
+            output_height,
+            output_width,
+            image_masks.stride(0),
+            image_masks.stride(1),
+            image_masks.stride(2),
+            BLOCK_MASK=triton.next_power_of_2(mask_height * mask_width),
+            BLOCK_OUT_H=triton.next_power_of_2(output_height),
+            BLOCK_OUT_W=triton.next_power_of_2(output_width),
+            BLOCK_ROI_H=_BLOCK_ROI_H,
+            MAX_ROI_WIDTH=_SPARSE_MAX_ROI_WIDTH,
+            MAX_TOTAL_RUNS=_SPARSE_MAX_TOTAL_RUNS,
+            METADATA_STRIDE=_HEADER_SIZE,
+            BLOCK_COLS=_SPARSE_BLOCK_COLS,
+        )
+        outputs_consumed_event = torch.cuda.Event()
+        outputs_consumed_event.record(torch.cuda.current_stream(image_scores.device))
+        class_metadata_host = _acquire_pinned_host_buffer(class_metadata)
+        records_host = _acquire_pinned_host_buffer(records)
+        # Pinned buffers let the DtoH copies follow the postprocess kernel on
+        # the CUDA stream while Python starts preparing later frames.
+        class_metadata_host.copy_(class_metadata, non_blocking=True)
+        records_host.copy_(records, non_blocking=True)
+        done_event = torch.cuda.Event()
+        done_event.record(torch.cuda.current_stream(image_scores.device))
+        return _deferred_instance_detections_from_sparse_query_records(
+            class_metadata_host=class_metadata_host,
+            records_host=records_host,
+            keepalive_tensors=(query_metadata, class_metadata, records),
+            done_event=done_event,
+            outputs_consumed_event=outputs_consumed_event,
+            max_total_runs=_SPARSE_MAX_TOTAL_RUNS,
+            height=output_height,
+            width=output_width,
+            max_detections=num_queries,
+        )
 
     # First pass: keep the common case small by selecting only the best class
     # for each query and emitting sparse RLE runs for those query masks.
@@ -309,6 +438,7 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
         image_bboxes,
         class_mapping,
         metadata,
+        metadata,
         records,
         confidence_threshold,
         num_queries,
@@ -319,6 +449,7 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
         BLOCK_CLASSES=triton.next_power_of_2(num_classes),
         METADATA_STRIDE=_HEADER_SIZE,
         MAX_CLASSES_PER_QUERY=_SPARSE_MAX_CLASSES_PER_QUERY,
+        FLAG_WRITE_QUERY_METADATA=False,
         FLAG_OVERFLOW_CLASSES=True,
     )
     _sparse_atomic_rle_from_metadata_kernel[
@@ -415,6 +546,7 @@ def _instance_detections_from_sparse_records(
     class_id = torch.from_numpy(metadata_host[active_ranks, 1].copy()).int()
 
     rle_masks = []
+    rle_counts = []
     for rank in active_ranks.tolist():
         if records_host is None:
             rank_records = np.empty((0, 3), dtype=np.int32)
@@ -437,18 +569,185 @@ def _instance_detections_from_sparse_records(
             height=height,
             width=width,
         )
+        rle_counts.append(counts)
         rle_masks.append(_rle_from_counts(counts=counts, height=height, width=width))
 
     instances_masks = InstancesRLEMasks.from_coco_rle_masks(
         image_size=(height, width),
         masks=rle_masks,
     )
+    # The pipeline RLE-to-polygon path consumes uncompressed counts directly, so
+    # keep them beside the pycocotools-compressed masks instead of decoding later.
+    _attach_uncompressed_counts(instances_masks, rle_counts)
     return InstanceDetections(
         xyxy=boxes,
         confidence=confidence,
         class_id=class_id,
         mask=instances_masks,
     )
+
+
+def _instance_detections_from_sparse_query_records(
+    class_metadata_host: np.ndarray,
+    records_host: np.ndarray,
+    max_total_runs: int,
+    height: int,
+    width: int,
+    max_detections: Optional[int] = None,
+) -> Optional[InstanceDetections]:
+    """Assemble detections when class rows share query-level RLE records.
+
+    Deferred pipeline mode emits up to four class candidates per query, but the
+    mask is identical for those class rows. The GPU therefore writes RLE records
+    once per query and this CPU helper fans that query mask out to the selected
+    class detections.
+    """
+    active_ranks = np.flatnonzero(class_metadata_host[:, 0] > 0.5)
+    if active_ranks.size == 0:
+        return InstanceDetections(
+            xyxy=torch.empty((0, 4), dtype=torch.int32),
+            confidence=torch.empty((0,), dtype=torch.float32),
+            class_id=torch.empty((0,), dtype=torch.int32),
+            mask=InstancesRLEMasks.from_coco_rle_masks(
+                image_size=(height, width),
+                masks=[],
+            ),
+        )
+    if np.any(class_metadata_host[active_ranks, 8] > 0.5):
+        return None
+    total_runs = int(records_host[0, 0])
+    if int(records_host[0, 1]) != 0 or total_runs < 0 or total_runs > max_total_runs:
+        return None
+
+    # Sort class candidates by the same score/key order as the eager path. The
+    # RLE records remain keyed by source query and are looked up below.
+    order = np.lexsort(
+        (
+            -class_metadata_host[active_ranks, 10],
+            -class_metadata_host[active_ranks, 2],
+        )
+    )
+    active_ranks = active_ranks[order]
+    if max_detections is not None:
+        active_ranks = active_ranks[:max_detections]
+    if total_runs:
+        records_host = records_host[1 : total_runs + 1]
+        # Group all records once by query and start position. This replaces the
+        # previous per-detection full-record scan while preserving stable order
+        # for duplicate starts within a query.
+        record_order = np.argsort(records_host[:, 1], kind="stable")
+        records_host = records_host[record_order]
+        record_order = np.argsort(records_host[:, 0], kind="stable")
+        records_host = records_host[record_order]
+        record_queries = records_host[:, 0]
+    else:
+        records_host = None
+        record_queries = None
+    boxes = (
+        torch.from_numpy(class_metadata_host[active_ranks, 3:7].copy()).round().int()
+    )
+    confidence = torch.from_numpy(class_metadata_host[active_ranks, 2].copy())
+    class_id = torch.from_numpy(class_metadata_host[active_ranks, 1].copy()).int()
+
+    rle_masks = []
+    rle_counts = []
+    for rank in active_ranks.tolist():
+        query_index = int(class_metadata_host[rank, 9])
+        if records_host is None:
+            rank_records = np.empty((0, 3), dtype=np.int32)
+        else:
+            # ``records_host`` is grouped by query once above, so each detection
+            # pays two binary searches instead of scanning every sparse run.
+            start_index = np.searchsorted(record_queries, query_index, side="left")
+            end_index = np.searchsorted(record_queries, query_index, side="right")
+            rank_records = records_host[start_index:end_index]
+        if rank_records.size:
+            starts_array = rank_records[:, 1].astype(np.int64, copy=False)
+            ends_array = rank_records[:, 2].astype(np.int64, copy=False)
+        else:
+            starts_array = np.empty((0,), dtype=np.int64)
+            ends_array = np.empty((0,), dtype=np.int64)
+        counts = _counts_from_runs(
+            starts=starts_array,
+            ends=ends_array,
+            height=height,
+            width=width,
+        )
+        rle_counts.append(counts)
+        rle_masks.append(_rle_from_counts(counts=counts, height=height, width=width))
+
+    instances_masks = InstancesRLEMasks.from_coco_rle_masks(
+        image_size=(height, width),
+        masks=rle_masks,
+    )
+    # The pipeline RLE-to-polygon path consumes uncompressed counts directly, so
+    # keep them beside the pycocotools-compressed masks instead of decoding later.
+    _attach_uncompressed_counts(instances_masks, rle_counts)
+    return InstanceDetections(
+        xyxy=boxes,
+        confidence=confidence,
+        class_id=class_id,
+        mask=instances_masks,
+    )
+
+
+def _deferred_instance_detections_from_sparse_query_records(
+    class_metadata_host: torch.Tensor,
+    records_host: torch.Tensor,
+    keepalive_tensors: tuple,
+    done_event: torch.cuda.Event,
+    outputs_consumed_event: torch.cuda.Event,
+    max_total_runs: int,
+    height: int,
+    width: int,
+    max_detections: Optional[int],
+) -> InstanceDetections:
+    """Return a placeholder detection object with deferred CPU finalization.
+
+    The CUDA stream already owns the postprocess kernels and async DtoH copies.
+    Returning this placeholder lets the streaming scheduler submit more GPU work
+    before synchronizing on ``done_event`` and converting sparse records to
+    ``InstanceDetections``.
+    """
+
+    def finalize() -> InstanceDetections:
+        """Synchronize the DtoH copies and build the real detections."""
+        try:
+            done_event.synchronize()
+            # Keep device tensors alive until the recorded copies complete; CUDA
+            # does not retain Python references for us.
+            _ = keepalive_tensors
+            result = _instance_detections_from_sparse_query_records(
+                class_metadata_host=class_metadata_host.numpy(),
+                records_host=records_host.numpy(),
+                max_total_runs=max_total_runs,
+                height=height,
+                width=width,
+                max_detections=max_detections,
+            )
+            if result is None:
+                raise RuntimeError("Deferred RF-DETR Triton RLE postprocess failed")
+            return result
+        finally:
+            _release_pinned_host_buffer(class_metadata_host)
+            _release_pinned_host_buffer(records_host)
+
+    detections = InstanceDetections(
+        xyxy=torch.empty((0, 4), dtype=torch.int32),
+        confidence=torch.empty((0,), dtype=torch.float32),
+        class_id=torch.empty((0,), dtype=torch.int32),
+        mask=InstancesRLEMasks.from_coco_rle_masks(
+            image_size=(height, width),
+            masks=[],
+        ),
+    )
+    attach_deferred_postprocess_handoff(
+        detections=detections,
+        done_event=done_event,
+        trt_outputs_consumed_event=outputs_consumed_event,
+        finalize=finalize,
+    )
+    return detections
 
 
 def _should_retry_sparse_topk_metadata(
@@ -593,6 +892,30 @@ def _rle_from_counts(counts: List[int], height: int, width: int) -> dict:
     return mask_utils.frPyObjects(
         {"counts": counts, "size": [height, width]}, height, width
     )
+
+
+def _attach_uncompressed_counts(
+    masks: InstancesRLEMasks,
+    rle_counts: List[List[int]],
+) -> None:
+    """Attach padded uncompressed COCO counts for downstream polygon conversion.
+
+    ``InstancesRLEMasks`` stores compressed pycocotools RLEs for normal API
+    compatibility. The pipeline branch also converts masks to polygons; keeping
+    the uncompressed counts here avoids an extra compressed-RLE decode on that
+    hot CPU path.
+    """
+    max_length = max((len(counts) for counts in rle_counts), default=0)
+    counts_array = np.zeros((len(rle_counts), max_length), dtype=np.int64)
+    lengths_array = np.empty((len(rle_counts),), dtype=np.int32)
+    for index, counts in enumerate(rle_counts):
+        counts_length = len(counts)
+        lengths_array[index] = counts_length
+        counts_array[index, :counts_length] = counts
+    # Private attributes are intentionally used as an optional fast-path cache;
+    # callers without this branch still rely on the standard compressed masks.
+    masks._rle_counts_cpu = counts_array  # type: ignore[attr-defined]
+    masks._rle_lengths_cpu = lengths_array  # type: ignore[attr-defined]
 
 
 if triton is not None:
@@ -755,6 +1078,7 @@ if triton is not None:
         bboxes,
         class_mapping,
         metadata,
+        query_metadata,
         records,
         threshold: tl.constexpr,
         num_queries: tl.constexpr,
@@ -765,6 +1089,7 @@ if triton is not None:
         BLOCK_CLASSES: tl.constexpr,
         METADATA_STRIDE: tl.constexpr,
         MAX_CLASSES_PER_QUERY: tl.constexpr,
+        FLAG_WRITE_QUERY_METADATA: tl.constexpr,
         FLAG_OVERFLOW_CLASSES: tl.constexpr,
     ):
         """Emit top passing query-class metadata rows for one RF-DETR query.
@@ -788,6 +1113,13 @@ if triton is not None:
                 the ``class_rank``-th highest passing class for that query.
                 Columns have the same layout as
                 ``_select_best_query_metadata_kernel``.
+            query_metadata: CUDA float32 tensor with shape
+                ``[num_queries, METADATA_STRIDE]`` when
+                ``FLAG_WRITE_QUERY_METADATA`` is true. In deferred pipeline
+                mode, class metadata is expanded but the RLE kernel should still
+                run once per query, so class rank 0 is also written to this
+                query-level buffer. When ``FLAG_WRITE_QUERY_METADATA`` is false,
+                callers pass ``metadata`` here and the argument is unused.
             records: CUDA int32 tensor with shape ``[MAX_TOTAL_RUNS + 1, 3]``.
                 Program 0 resets ``records[0, 0]`` and ``records[0, 1]`` before
                 the RLE kernel appends runs.
@@ -801,6 +1133,9 @@ if triton is not None:
             BLOCK_CLASSES: Power-of-two tile width covering all class columns.
             METADATA_STRIDE: Number of float32 fields per metadata row.
             MAX_CLASSES_PER_QUERY: Number of metadata rows reserved per query.
+            FLAG_WRITE_QUERY_METADATA: When true, additionally writes the best
+                passing class row for each query into ``query_metadata`` for the
+                deferred pipeline RLE kernel.
             FLAG_OVERFLOW_CLASSES: When true, writes ``records[0, 1] = 1`` if
                 more than ``MAX_CLASSES_PER_QUERY`` classes pass threshold; the
                 caller treats that as unsupported for exact top-k parity.
@@ -904,6 +1239,39 @@ if triton is not None:
             tl.store(metadata + meta_base + 4, y1)
             tl.store(metadata + meta_base + 5, x2)
             tl.store(metadata + meta_base + 6, y2)
+            if FLAG_WRITE_QUERY_METADATA and class_rank == 0:
+                # The pipeline path wants best-query metadata for the RLE
+                # kernel while retaining expanded class metadata for CPU
+                # finalization.
+                query_meta_base = query_index * METADATA_STRIDE
+                tl.store(
+                    query_metadata + query_meta_base + 0,
+                    tl.where(is_valid_detection, 1.0, 0.0),
+                )
+                tl.store(
+                    query_metadata + query_meta_base + 1, mapped_class.to(tl.float32)
+                )
+                tl.store(
+                    query_metadata + query_meta_base + 2,
+                    tl.where(is_valid_detection, selected_score, 0.0),
+                )
+                tl.store(query_metadata + query_meta_base + 3, x1)
+                tl.store(query_metadata + query_meta_base + 4, y1)
+                tl.store(query_metadata + query_meta_base + 5, x2)
+                tl.store(query_metadata + query_meta_base + 6, y2)
+                tl.store(query_metadata + query_meta_base + 7, 0.0)
+                tl.store(query_metadata + query_meta_base + 8, 0.0)
+                tl.store(
+                    query_metadata + query_meta_base + 9, query_index.to(tl.float32)
+                )
+                tl.store(
+                    query_metadata + query_meta_base + 10, selected_index.to(tl.float32)
+                )
+                tl.store(query_metadata + query_meta_base + 11, 0.0)
+                tl.store(query_metadata + query_meta_base + 12, 0.0)
+                tl.store(query_metadata + query_meta_base + 13, 0.0)
+                tl.store(query_metadata + query_meta_base + 14, 0.0)
+                tl.store(query_metadata + query_meta_base + 15, 0.0)
             work_scores = tl.where(class_offsets == selected_class, -1.0, work_scores)
 
     @triton.jit

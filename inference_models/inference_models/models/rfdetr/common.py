@@ -232,6 +232,7 @@ def _post_process_single_instance_segmentation_result_to_rle_masks_with_triton(
     threshold: Union[float, torch.Tensor],
     num_classes: int,
     classes_re_mapping: Optional[ClassesReMapping],
+    defer_postprocess_sync: bool = False,
 ) -> InstanceDetections:
     triton_result = (
         post_process_single_instance_segmentation_result_to_rle_masks_triton(
@@ -241,6 +242,7 @@ def _post_process_single_instance_segmentation_result_to_rle_masks_with_triton(
             image_meta=image_meta,
             threshold=threshold,
             classes_re_mapping=classes_re_mapping,
+            defer_postprocess_sync=defer_postprocess_sync,
         )
     )
     if triton_result is not None:
@@ -364,18 +366,33 @@ def post_process_instance_segmentation_results_to_rle_masks(
     threshold: Union[float, torch.Tensor],
     num_classes: int,
     classes_re_mapping: Optional[ClassesReMapping],
+    defer_postprocess_sync: bool = False,
 ) -> List[InstanceDetections]:
     logits_sigmoid = torch.nn.functional.sigmoid(logits)
     device = bboxes.device
     if isinstance(threshold, torch.Tensor):
         threshold = threshold.to(device=device, dtype=logits_sigmoid.dtype)
-    post_process_single = (
-        _post_process_single_instance_segmentation_result_to_rle_masks_with_triton
-        if _TRITON_POSTPROC_ENABLED
-        else _post_process_single_instance_segmentation_result_to_rle_masks
-    )
+    if _TRITON_POSTPROC_ENABLED:
+        return [
+            _post_process_single_instance_segmentation_result_to_rle_masks_with_triton(
+                image_bboxes=image_bboxes,
+                image_logits=image_logits,
+                image_masks=image_masks,
+                image_meta=image_meta,
+                threshold=threshold,
+                num_classes=num_classes,
+                classes_re_mapping=classes_re_mapping,
+                defer_postprocess_sync=defer_postprocess_sync,
+            )
+            for image_bboxes, image_logits, image_masks, image_meta in zip(
+                bboxes,
+                logits_sigmoid,
+                masks,
+                pre_processing_meta,
+            )
+        ]
     return [
-        post_process_single(
+        _post_process_single_instance_segmentation_result_to_rle_masks(
             image_bboxes=image_bboxes,
             image_logits=image_logits,
             image_masks=image_masks,
