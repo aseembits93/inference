@@ -252,6 +252,7 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG TRITON_VERSION=3.6.0
 ENV LANG=en_US.UTF-8
 
 WORKDIR /app
@@ -313,7 +314,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache-jp71-ru
     libglib2.0-0 \
     libatomic1
 
-# Copy GDAL (skip headers - not needed in runtime)
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+    --extra-index-url https://pypi.jetson-ai-lab.io/sbsa/cu130 \
+    "triton==${TRITON_VERSION}"
+
+    # Copy GDAL (skip headers - not needed in runtime)
 COPY --from=builder /usr/local/bin/gdal* /usr/local/bin/
 COPY --from=builder /usr/local/bin/ogr* /usr/local/bin/
 COPY --from=builder /usr/local/bin/gnm* /usr/local/bin/
