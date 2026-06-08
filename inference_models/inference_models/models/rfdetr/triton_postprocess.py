@@ -67,6 +67,7 @@ _SPARSE_TOPK_MAX_TOTAL_RUNS = _SPARSE_MAX_TOTAL_RUNS * _SPARSE_MAX_CLASSES_PER_Q
 _SPARSE_SOURCE_BOUNDS_BLOCK_PIXELS = 1024
 _MAX_RFDETR_SEG_2XLARGE_MASK_PIXELS = 192 * 192
 _MAX_QUERY_CLASS_PRODUCTS = 65536
+_MAX_INTERPOLATION_TAPS = 8
 _MAX_INTERPOLATION_WEIGHT_CACHE_ENTRIES = 16
 _INTERPOLATION_WEIGHT_CACHE = OrderedDict()
 _INTERPOLATION_WEIGHT_CACHE_LOCK = Lock()
@@ -81,14 +82,14 @@ def _get_interpolation_weights(
     output_size: int,
     device: torch.device,
     axis: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return sparse two-tap bilinear interpolation tables for one axis.
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, int]]:
+    """Return sparse bilinear interpolation tables for one axis.
 
     The Triton RLE kernel needs to reproduce ``torchvision.functional.resize``
     with bilinear antialiasing, but it cannot call PyTorch's resize from inside
     a kernel. We build the interpolation matrix once by resizing an identity
-    basis, keep only the non-zero source index and weight pairs for each output
-    coordinate, and cache those small tables per device/shape/axis.
+    basis, keep only the non-zero source index and weight entries for each
+    output coordinate, and cache those small tables per device/shape/axis.
     """
     device_key = _interpolation_cache_key(src_size, output_size, device, axis)
     with _INTERPOLATION_WEIGHT_CACHE_LOCK:
@@ -120,10 +121,18 @@ def _get_interpolation_weights(
         )[:, 0, 0, :].T.contiguous()
 
     nonzero = weights != 0
-    if int(nonzero.sum(dim=1).max().item()) > 2:
-        raise ValueError("Expected antialiased bilinear interpolation to use 2 taps")
-    indices = torch.zeros((output_size, 2), dtype=torch.int32, device=device)
-    values = torch.zeros((output_size, 2), dtype=torch.float32, device=device)
+    max_taps = int(nonzero.sum(dim=1).max().item())
+    if max_taps > _MAX_INTERPOLATION_TAPS:
+        warnings.warn(
+            "RF-DETR Triton postprocess path is unsupported: "
+            f"{axis} resize {src_size}->{output_size} requires {max_taps} "
+            f"interpolation taps, max supported is {_MAX_INTERPOLATION_TAPS}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    indices = torch.zeros((output_size, max_taps), dtype=torch.int32, device=device)
+    values = torch.zeros((output_size, max_taps), dtype=torch.float32, device=device)
     for output_index in range(output_size):
         source_indices = nonzero[output_index].nonzero(as_tuple=True)[0]
         indices[output_index, : source_indices.numel()] = source_indices.to(
@@ -133,7 +142,7 @@ def _get_interpolation_weights(
             output_index, source_indices
         ]
 
-    cached_value = (indices, values)
+    cached_value = (indices, values, max_taps)
     with _INTERPOLATION_WEIGHT_CACHE_LOCK:
         cached = _INTERPOLATION_WEIGHT_CACHE.get(device_key)
         if cached is not None:
@@ -265,18 +274,22 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
 
     # Precompute resize tables outside the hot kernel. The tables are tiny
     # compared with the full-resolution masks and can be reused across frames.
-    y_idx, y_weight = _get_interpolation_weights(
+    y_tables = _get_interpolation_weights(
         src_size=mask_height,
         output_size=output_height,
         device=image_masks.device,
         axis="height",
     )
-    x_idx, x_weight = _get_interpolation_weights(
+    x_tables = _get_interpolation_weights(
         src_size=mask_width,
         output_size=output_width,
         device=image_masks.device,
         axis="width",
     )
+    if y_tables is None or x_tables is None:
+        return None
+    y_idx, y_weight, y_taps = y_tables
+    x_idx, x_weight, x_taps = x_tables
 
     if defer_postprocess_sync:
         # Deferred pipeline mode separates class metadata from query mask RLE:
@@ -369,6 +382,8 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
             MAX_TOTAL_RUNS=_SPARSE_MAX_TOTAL_RUNS,
             METADATA_STRIDE=_HEADER_SIZE,
             BLOCK_COLS=_SPARSE_BLOCK_COLS,
+            Y_TAPS=y_taps,
+            X_TAPS=x_taps,
         )
         outputs_consumed_event = torch.cuda.Event()
         outputs_consumed_event.record(torch.cuda.current_stream(image_scores.device))
@@ -469,6 +484,8 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
         MAX_TOTAL_RUNS=_SPARSE_MAX_TOTAL_RUNS,
         METADATA_STRIDE=_HEADER_SIZE,
         BLOCK_COLS=_SPARSE_BLOCK_COLS,
+        Y_TAPS=y_taps,
+        X_TAPS=x_taps,
     )
 
     metadata_host = metadata.cpu().numpy()
@@ -574,6 +591,8 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
         MAX_TOTAL_RUNS=_SPARSE_TOPK_MAX_TOTAL_RUNS,
         METADATA_STRIDE=_HEADER_SIZE,
         BLOCK_COLS=_SPARSE_BLOCK_COLS,
+        Y_TAPS=y_taps,
+        X_TAPS=x_taps,
     )
     metadata_host = metadata.cpu().numpy()
     return _instance_detections_from_sparse_records(
@@ -1462,6 +1481,8 @@ if triton is not None:
         MAX_TOTAL_RUNS: tl.constexpr,
         METADATA_STRIDE: tl.constexpr,
         BLOCK_COLS: tl.constexpr,
+        Y_TAPS: tl.constexpr,
+        X_TAPS: tl.constexpr,
     ):
         """Interpolate active mask ROIs and emit COCO-order RLE run records.
 
@@ -1479,15 +1500,15 @@ if triton is not None:
                 tensors. Values are mask logits already in the RF-DETR mask
                 space; output pixels are positive when bilinear interpolation is
                 greater than zero.
-            y_idx: CUDA int32 tensor with shape ``[output_height, 2]``. For each
-                output row, stores the two source mask rows used by the
+            y_idx: CUDA int32 tensor with shape ``[output_height, Y_TAPS]``. For
+                each output row, stores the source mask rows used by the
                 reference antialiased bilinear resize.
-            y_weight: CUDA float32 tensor with shape ``[output_height, 2]``.
+            y_weight: CUDA float32 tensor with shape ``[output_height, Y_TAPS]``.
                 Weights matching ``y_idx``.
-            x_idx: CUDA int32 tensor with shape ``[output_width, 2]``. For each
-                output column, stores the two source mask columns used by the
+            x_idx: CUDA int32 tensor with shape ``[output_width, X_TAPS]``. For
+                each output column, stores the source mask columns used by the
                 reference resize.
-            x_weight: CUDA float32 tensor with shape ``[output_width, 2]``.
+            x_weight: CUDA float32 tensor with shape ``[output_width, X_TAPS]``.
                 Weights matching ``x_idx``.
             metadata: CUDA float32 tensor with shape
                 ``[metadata_rows, METADATA_STRIDE]``. The kernel reads column
@@ -1549,30 +1570,25 @@ if triton is not None:
 
         out_y_offsets = tl.arange(0, BLOCK_OUT_H)
         y_active = out_y_offsets < output_height
-        interp_y0 = tl.load(y_idx + out_y_offsets * 2, mask=y_active, other=-1)
-        interp_y1 = tl.load(y_idx + out_y_offsets * 2 + 1, mask=y_active, other=-1)
-        interp_y_weight0 = tl.load(
-            y_weight + out_y_offsets * 2,
-            mask=y_active,
-            other=0.0,
-        )
-        interp_y_weight1 = tl.load(
-            y_weight + out_y_offsets * 2 + 1,
-            mask=y_active,
-            other=0.0,
-        )
-        candidate_y = y_active & (
-            (
-                (interp_y0 >= source_y_min)
-                & (interp_y0 <= source_y_max)
-                & (interp_y_weight0 != 0.0)
+        candidate_y = out_y_offsets < 0
+        y_table_base = out_y_offsets * Y_TAPS
+        for tap in tl.static_range(0, Y_TAPS):
+            interp_y = tl.load(
+                y_idx + y_table_base + tap,
+                mask=y_active,
+                other=-1,
             )
-            | (
-                (interp_y1 >= source_y_min)
-                & (interp_y1 <= source_y_max)
-                & (interp_y_weight1 != 0.0)
+            interp_y_weight = tl.load(
+                y_weight + y_table_base + tap,
+                mask=y_active,
+                other=0.0,
             )
-        )
+            candidate_y = candidate_y | (
+                y_active
+                & (interp_y >= source_y_min)
+                & (interp_y <= source_y_max)
+                & (interp_y_weight != 0.0)
+            )
         roi_y_start = tl.min(
             tl.where(candidate_y, out_y_offsets, output_height), axis=0
         )
@@ -1580,30 +1596,25 @@ if triton is not None:
 
         out_x_offsets = tl.arange(0, BLOCK_OUT_W)
         x_active = out_x_offsets < output_width
-        interp_x0 = tl.load(x_idx + out_x_offsets * 2, mask=x_active, other=-1)
-        interp_x1 = tl.load(x_idx + out_x_offsets * 2 + 1, mask=x_active, other=-1)
-        interp_x_weight0 = tl.load(
-            x_weight + out_x_offsets * 2,
-            mask=x_active,
-            other=0.0,
-        )
-        interp_x_weight1 = tl.load(
-            x_weight + out_x_offsets * 2 + 1,
-            mask=x_active,
-            other=0.0,
-        )
-        candidate_x = x_active & (
-            (
-                (interp_x0 >= source_x_min)
-                & (interp_x0 <= source_x_max)
-                & (interp_x_weight0 != 0.0)
+        candidate_x = out_x_offsets < 0
+        x_table_base = out_x_offsets * X_TAPS
+        for tap in tl.static_range(0, X_TAPS):
+            interp_x = tl.load(
+                x_idx + x_table_base + tap,
+                mask=x_active,
+                other=-1,
             )
-            | (
-                (interp_x1 >= source_x_min)
-                & (interp_x1 <= source_x_max)
-                & (interp_x_weight1 != 0.0)
+            interp_x_weight = tl.load(
+                x_weight + x_table_base + tap,
+                mask=x_active,
+                other=0.0,
             )
-        )
+            candidate_x = candidate_x | (
+                x_active
+                & (interp_x >= source_x_min)
+                & (interp_x <= source_x_max)
+                & (interp_x_weight != 0.0)
+            )
         roi_x_start = tl.min(tl.where(candidate_x, out_x_offsets, output_width), axis=0)
         roi_x_end = tl.max(tl.where(candidate_x, out_x_offsets + 1, 0), axis=0)
         roi_width = roi_x_end - roi_x_start
@@ -1629,27 +1640,7 @@ if triton is not None:
             column_active = local_x_offsets < roi_width
             output_x = roi_x_start + local_x_offsets
             output_x_matrix = output_x[None, :]
-            x_base = output_x_matrix * 2
-            source_x0 = tl.load(
-                x_idx + x_base,
-                mask=column_active[None, :],
-                other=0,
-            ).to(tl.int64)
-            source_x1 = tl.load(
-                x_idx + x_base + 1,
-                mask=column_active[None, :],
-                other=0,
-            ).to(tl.int64)
-            x_weight0 = tl.load(
-                x_weight + x_base,
-                mask=column_active[None, :],
-                other=0.0,
-            )
-            x_weight1 = tl.load(
-                x_weight + x_base + 1,
-                mask=column_active[None, :],
-                other=0.0,
-            )
+            x_base = output_x_matrix * X_TAPS
 
             # Open slots carry a run that began in a prior row tile but has not
             # ended yet. The slot stores the record index whose end is pending.
@@ -1661,113 +1652,72 @@ if triton is not None:
                 active = (row_y[:, None] < roi_y_end) & column_active[None, :]
                 boundary_active = (row_y[:, None] <= roi_y_end) & column_active[None, :]
 
-                y_base = output_y * 2
-                source_y0 = tl.load(y_idx + y_base, mask=active, other=0).to(tl.int64)
-                source_y1 = tl.load(y_idx + y_base + 1, mask=active, other=0).to(
-                    tl.int64
-                )
-                y_weight0 = tl.load(y_weight + y_base, mask=active, other=0.0)
-                y_weight1 = tl.load(y_weight + y_base + 1, mask=active, other=0.0)
-                value00 = tl.load(
-                    masks
-                    + mask_base
-                    + source_y0 * mask_stride_h
-                    + source_x0 * mask_stride_w,
-                    mask=active,
-                    other=0.0,
-                )
-                value10 = tl.load(
-                    masks
-                    + mask_base
-                    + source_y1 * mask_stride_h
-                    + source_x0 * mask_stride_w,
-                    mask=active,
-                    other=0.0,
-                )
-                value01 = tl.load(
-                    masks
-                    + mask_base
-                    + source_y0 * mask_stride_h
-                    + source_x1 * mask_stride_w,
-                    mask=active,
-                    other=0.0,
-                )
-                value11 = tl.load(
-                    masks
-                    + mask_base
-                    + source_y1 * mask_stride_h
-                    + source_x1 * mask_stride_w,
-                    mask=active,
-                    other=0.0,
-                )
-                current_values = (
-                    value00 * y_weight0 + value10 * y_weight1
-                ) * x_weight0 + (value01 * y_weight0 + value11 * y_weight1) * x_weight1
-                current_positive = active & (current_values > 0.0)
-
                 # Starts/ends are transitions along a COCO column-major scan:
                 # current positive after previous background starts a run;
                 # previous positive followed by current background ends it.
                 previous_y = output_y - 1
                 previous_active = boundary_active & (row_y[:, None] > roi_y_start)
-                previous_y_base = previous_y * 2
-                prev_source_y0 = tl.load(
-                    y_idx + previous_y_base,
-                    mask=previous_active,
-                    other=0,
-                ).to(tl.int64)
-                prev_source_y1 = tl.load(
-                    y_idx + previous_y_base + 1,
-                    mask=previous_active,
-                    other=0,
-                ).to(tl.int64)
-                prev_y_weight0 = tl.load(
-                    y_weight + previous_y_base,
-                    mask=previous_active,
-                    other=0.0,
-                )
-                prev_y_weight1 = tl.load(
-                    y_weight + previous_y_base + 1,
-                    mask=previous_active,
-                    other=0.0,
-                )
-                prev_value00 = tl.load(
-                    masks
-                    + mask_base
-                    + prev_source_y0 * mask_stride_h
-                    + source_x0 * mask_stride_w,
-                    mask=previous_active,
-                    other=0.0,
-                )
-                prev_value10 = tl.load(
-                    masks
-                    + mask_base
-                    + prev_source_y1 * mask_stride_h
-                    + source_x0 * mask_stride_w,
-                    mask=previous_active,
-                    other=0.0,
-                )
-                prev_value01 = tl.load(
-                    masks
-                    + mask_base
-                    + prev_source_y0 * mask_stride_h
-                    + source_x1 * mask_stride_w,
-                    mask=previous_active,
-                    other=0.0,
-                )
-                prev_value11 = tl.load(
-                    masks
-                    + mask_base
-                    + prev_source_y1 * mask_stride_h
-                    + source_x1 * mask_stride_w,
-                    mask=previous_active,
-                    other=0.0,
-                )
-                previous_values = (
-                    prev_value00 * prev_y_weight0 + prev_value10 * prev_y_weight1
-                ) * x_weight0 + (
-                    prev_value01 * prev_y_weight0 + prev_value11 * prev_y_weight1
-                ) * x_weight1
+                y_base = output_y * Y_TAPS
+                previous_y_base = previous_y * Y_TAPS
+                current_values = tl.zeros((BLOCK_ROI_H, BLOCK_COLS), tl.float32)
+                previous_values = tl.zeros((BLOCK_ROI_H, BLOCK_COLS), tl.float32)
+                for y_tap in tl.static_range(0, Y_TAPS):
+                    source_y = tl.load(
+                        y_idx + y_base + y_tap,
+                        mask=active,
+                        other=0,
+                    ).to(tl.int64)
+                    y_weight_value = tl.load(
+                        y_weight + y_base + y_tap,
+                        mask=active,
+                        other=0.0,
+                    )
+                    prev_source_y = tl.load(
+                        y_idx + previous_y_base + y_tap,
+                        mask=previous_active,
+                        other=0,
+                    ).to(tl.int64)
+                    prev_y_weight_value = tl.load(
+                        y_weight + previous_y_base + y_tap,
+                        mask=previous_active,
+                        other=0.0,
+                    )
+                    for x_tap in tl.static_range(0, X_TAPS):
+                        source_x = tl.load(
+                            x_idx + x_base + x_tap,
+                            mask=column_active[None, :],
+                            other=0,
+                        ).to(tl.int64)
+                        x_weight_value = tl.load(
+                            x_weight + x_base + x_tap,
+                            mask=column_active[None, :],
+                            other=0.0,
+                        )
+                        current_values += (
+                            tl.load(
+                                masks
+                                + mask_base
+                                + source_y * mask_stride_h
+                                + source_x * mask_stride_w,
+                                mask=active,
+                                other=0.0,
+                            )
+                            * y_weight_value
+                            * x_weight_value
+                        )
+                        previous_values += (
+                            tl.load(
+                                masks
+                                + mask_base
+                                + prev_source_y * mask_stride_h
+                                + source_x * mask_stride_w,
+                                mask=previous_active,
+                                other=0.0,
+                            )
+                            * prev_y_weight_value
+                            * x_weight_value
+                        )
+                current_positive = active & (current_values > 0.0)
                 previous_positive = previous_active & (previous_values > 0.0)
                 is_start = current_positive & ~previous_positive
                 is_end = previous_positive & ~current_positive
