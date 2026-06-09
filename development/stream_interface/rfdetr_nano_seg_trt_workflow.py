@@ -4,8 +4,7 @@ run via InferencePipeline on a single video source.
 Workflow has exactly one block — the segmentation model. No annotators, no
 buffer strategies, no rate limiting.
 
-The `--backend` flag (trt | onnx | torch) is parsed before importing
-`inference` and pins the auto-loader by setting
+The `--backend` flag (trt | onnx | torch) pins the auto-loader by setting
 `DISABLED_INFERENCE_MODELS_BACKENDS` to every backend except the chosen one,
 so the benchmark numbers correspond unambiguously to a single execution path.
 
@@ -13,6 +12,9 @@ Pass `--model_package_id` to download a specific registry package (cached under
 `$INFERENCE_HOME/models-cache/`) and run the benchmark against that artefact
 instead of auto-negotiation. A TRT package directory in the cwd is still used
 when present and `--model_package_id` is not set.
+
+Use `--mode compare` to run baseline and optimized configurations sequentially
+in separate child processes (no interleaving, no parent GPU warmup).
 
 Defaults: rfdetr-seg-nano @ confidence 0.4 on the native TRT backend.
 """
@@ -22,7 +24,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
+from time import perf_counter
 
 _ALL_BACKENDS = {
     "torch",
@@ -37,6 +42,28 @@ _DEFAULT_MODEL_ID = "rfdetr-seg-nano"
 _PREFERRED_LOCAL_TRT_PACKAGE = "rfdetr-seg-nano-orin-trt-package"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _INFERENCE_MODELS_ROOT = _REPO_ROOT / "inference_models"
+_SELF = Path(__file__).resolve()
+_PY = sys.executable
+
+_BASELINE_FLAGS = {
+    "ENABLE_AUTO_CUDA_GRAPHS_FOR_TRT_BACKEND": "false",
+    "INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED": "false",
+    "INFERENCE_MODELS_RFDETR_TRITON_POSTPROC_ENABLED": "false",
+    "RFDETR_PIPELINE_DEPTH": "1",
+}
+_OPTIMIZED_FLAGS = {
+    "ENABLE_AUTO_CUDA_GRAPHS_FOR_TRT_BACKEND": "true",
+    "INFERENCE_MODELS_RFDETR_TRITON_PREPROC_ENABLED": "true",
+    "INFERENCE_MODELS_RFDETR_TRITON_POSTPROC_ENABLED": "true",
+    "RFDETR_PIPELINE_DEPTH": "2",
+}
+_OPTIMIZATION_FLAG_KEYS = sorted(
+    {*_BASELINE_FLAGS.keys(), *_OPTIMIZED_FLAGS.keys()}
+)
+
+FRAME_COUNT = 0
+START_TIME = None
+PROGRESS_EVERY = 50
 
 
 def _is_local_trt_package(path: Path) -> bool:
@@ -65,43 +92,43 @@ def _find_local_trt_package() -> str | None:
     return None
 
 
-def _select_backend_from_argv() -> str:
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--backend", choices=("trt", "onnx", "torch"), default="trt")
-    args, _ = pre.parse_known_args()
-    return args.backend
+def _configure_backend(backend: str) -> None:
+    os.environ.setdefault(
+        "ONNXRUNTIME_EXECUTION_PROVIDERS",
+        "[TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider]",
+    )
+    os.environ["DISABLED_INFERENCE_MODELS_BACKENDS"] = ",".join(
+        sorted(_ALL_BACKENDS - {backend})
+    )
 
 
-_BACKEND = _select_backend_from_argv()
-os.environ.setdefault(
-    "ONNXRUNTIME_EXECUTION_PROVIDERS",
-    "[TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider]",
-)
-os.environ["DISABLED_INFERENCE_MODELS_BACKENDS"] = ",".join(
-    sorted(_ALL_BACKENDS - {_BACKEND})
-)
-for path in (str(_INFERENCE_MODELS_ROOT), str(_REPO_ROOT)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
-for module_name in list(sys.modules):
-    if module_name == "inference" or module_name.startswith("inference."):
-        del sys.modules[module_name]
-    if module_name == "inference_models" or module_name.startswith("inference_models."):
-        del sys.modules[module_name]
+def _prioritize_repo_imports() -> None:
+    for path in (str(_INFERENCE_MODELS_ROOT), str(_REPO_ROOT)):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    for module_name in list(sys.modules):
+        if module_name == "inference" or module_name.startswith("inference."):
+            del sys.modules[module_name]
+        if module_name == "inference_models" or module_name.startswith(
+            "inference_models."
+        ):
+            del sys.modules[module_name]
 
-from time import perf_counter
 
-_LOCAL_INFERENCE_SPEC = importlib.util.spec_from_file_location(
-    "inference",
-    _REPO_ROOT / "inference" / "__init__.py",
-    submodule_search_locations=[str(_REPO_ROOT / "inference")],
-)
-if _LOCAL_INFERENCE_SPEC is None or _LOCAL_INFERENCE_SPEC.loader is None:
-    raise RuntimeError("Could not load local inference package")
-_LOCAL_INFERENCE_MODULE = importlib.util.module_from_spec(_LOCAL_INFERENCE_SPEC)
-sys.modules["inference"] = _LOCAL_INFERENCE_MODULE
-_LOCAL_INFERENCE_SPEC.loader.exec_module(_LOCAL_INFERENCE_MODULE)
-InferencePipeline = _LOCAL_INFERENCE_MODULE.InferencePipeline
+def _load_inference_pipeline(*, backend: str):
+    _configure_backend(backend=backend)
+    _prioritize_repo_imports()
+    spec = importlib.util.spec_from_file_location(
+        "inference",
+        _REPO_ROOT / "inference" / "__init__.py",
+        submodule_search_locations=[str(_REPO_ROOT / "inference")],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not load local inference package")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["inference"] = module
+    spec.loader.exec_module(module)
+    return module.InferencePipeline
 
 
 def _fetch_model_package(model_id: str, package_id: str, backend: str) -> str:
@@ -204,9 +231,35 @@ def build_workflow(model_id: str, confidence: float) -> dict:
     }
 
 
-FRAME_COUNT = 0
-START_TIME = None
-PROGRESS_EVERY = 50
+def _format_optimization_flags() -> str:
+    rendered_flags = [
+        f"{key}={os.environ.get(key, '<unset>')}" for key in _OPTIMIZATION_FLAG_KEYS
+    ]
+    return ", ".join(rendered_flags)
+
+
+def _emit_benchmark_result(
+    *,
+    profile: str,
+    frame_count: int,
+    elapsed: float,
+    fps: float,
+    result_out: str | None,
+) -> None:
+    result = {
+        "profile": profile,
+        "frames": frame_count,
+        "elapsed": elapsed,
+        "fps": fps,
+        "flags": {key: os.environ.get(key) for key in _OPTIMIZATION_FLAG_KEYS},
+    }
+    print(
+        f"[benchmark] profile={profile} frames={frame_count} "
+        f"elapsed={elapsed:.2f}s fps={fps:.2f}",
+        flush=True,
+    )
+    if result_out is not None:
+        Path(result_out).write_text(json.dumps(result, indent=2))
 
 
 def sink(predictions, _video_frames) -> None:
@@ -222,30 +275,48 @@ def sink(predictions, _video_frames) -> None:
         print(f"[progress] frames={FRAME_COUNT} fps={fps:.2f}", flush=True)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video_reference", required=True)
-    parser.add_argument("--model_id", default=_DEFAULT_MODEL_ID)
-    parser.add_argument("--confidence", type=float, default=0.4)
-    parser.add_argument(
-        "--backend",
-        choices=("trt", "onnx", "torch"),
-        default="trt",
-        help="inference-models backend (consumed pre-import via env var).",
-    )
-    parser.add_argument(
-        "--model_package_id",
-        default=None,
-        help=(
-            "Registry package id to download and pin (via inference-models cache). "
-            "Overrides auto-negotiation and any cwd TRT package discovery."
-        ),
-    )
-    args = parser.parse_args()
+def _resolve_video_reference(video_reference: str) -> str:
+    video_path = Path(video_reference)
+    if video_path.is_absolute():
+        return str(video_path)
+    candidate = _REPO_ROOT / video_path
+    if candidate.exists():
+        return str(candidate.resolve())
+    return video_reference
+
+
+def _child_pythonpath(existing_pythonpath: str | None) -> str:
+    entries = [
+        str(path)
+        for path in (_REPO_ROOT, _INFERENCE_MODELS_ROOT)
+        if path.exists()
+    ]
+    if existing_pythonpath:
+        entries.append(existing_pythonpath)
+    return os.pathsep.join(entries)
+
+
+def do_run(
+    *,
+    video_reference: str,
+    model_id: str,
+    confidence: float,
+    backend: str,
+    model_package_id: str | None,
+    benchmark_profile: str,
+    result_out: str | None,
+) -> dict:
+    global FRAME_COUNT, START_TIME
+    FRAME_COUNT = 0
+    START_TIME = None
+
+    print(f"[benchmark] profile={benchmark_profile}", flush=True)
+    print(f"[benchmark] flags: {_format_optimization_flags()}", flush=True)
+
     local_package = _resolve_local_package(
-        backend=args.backend,
-        model_id=args.model_id,
-        model_package_id=args.model_package_id,
+        backend=backend,
+        model_id=model_id,
+        model_package_id=model_package_id,
     )
     if local_package is not None:
         os.environ.setdefault(
@@ -254,7 +325,7 @@ def main() -> None:
         )
 
     workflow_model_id = _resolve_model_id(
-        model_id=args.model_id,
+        model_id=model_id,
         local_package=local_package,
     )
     if local_package is not None:
@@ -267,9 +338,10 @@ def main() -> None:
             flush=True,
         )
 
-    pipeline = InferencePipeline.init_with_workflow(
-        video_reference=args.video_reference,
-        workflow_specification=build_workflow(workflow_model_id, args.confidence),
+    inference_pipeline = _load_inference_pipeline(backend=backend)
+    pipeline = inference_pipeline.init_with_workflow(
+        video_reference=_resolve_video_reference(video_reference),
+        workflow_specification=build_workflow(workflow_model_id, confidence),
         on_prediction=sink,
     )
     pipeline.start()
@@ -277,7 +349,202 @@ def main() -> None:
 
     elapsed = perf_counter() - START_TIME if START_TIME else 0.0
     fps = FRAME_COUNT / elapsed if elapsed > 0 else 0.0
-    print(f"frames={FRAME_COUNT} elapsed={elapsed:.2f}s fps={fps:.2f}")
+    _emit_benchmark_result(
+        profile=benchmark_profile,
+        frame_count=FRAME_COUNT,
+        elapsed=elapsed,
+        fps=fps,
+        result_out=result_out,
+    )
+    return {
+        "profile": benchmark_profile,
+        "frames": FRAME_COUNT,
+        "elapsed": elapsed,
+        "fps": fps,
+    }
+
+
+def _build_child_command(
+    *,
+    video_reference: str,
+    model_id: str,
+    confidence: float,
+    backend: str,
+    model_package_id: str | None,
+    benchmark_profile: str,
+    result_out: str,
+) -> list[str]:
+    command = [
+        _PY,
+        str(_SELF),
+        "--mode",
+        "run",
+        "--video_reference",
+        video_reference,
+        "--model_id",
+        model_id,
+        "--confidence",
+        str(confidence),
+        "--backend",
+        backend,
+        "--benchmark-profile",
+        benchmark_profile,
+        "--result-out",
+        result_out,
+    ]
+    if model_package_id is not None:
+        command.extend(["--model_package_id", model_package_id])
+    return command
+
+
+def _run_child_benchmark(
+    *,
+    benchmark_profile: str,
+    flags: dict[str, str],
+    video_reference: str,
+    model_id: str,
+    confidence: float,
+    backend: str,
+    model_package_id: str | None,
+    result_out: str,
+) -> dict:
+    env = os.environ.copy()
+    env.update(flags)
+    env["PYTHONPATH"] = _child_pythonpath(env.get("PYTHONPATH"))
+    command = _build_child_command(
+        video_reference=video_reference,
+        model_id=model_id,
+        confidence=confidence,
+        backend=backend,
+        model_package_id=model_package_id,
+        benchmark_profile=benchmark_profile,
+        result_out=result_out,
+    )
+    print(
+        "\n---- child ----\n"
+        f"  profile={benchmark_profile}\n"
+        f"  flags={flags}\n"
+        f"  result_out={result_out}",
+        flush=True,
+    )
+    subprocess.run(
+        command,
+        cwd=str(_REPO_ROOT),
+        env=env,
+        check=True,
+    )
+    return json.loads(Path(result_out).read_text())
+
+
+def do_compare(
+    *,
+    video_reference: str,
+    model_id: str,
+    confidence: float,
+    backend: str,
+    model_package_id: str | None,
+) -> None:
+    resolved_video_reference = _resolve_video_reference(video_reference)
+    with tempfile.TemporaryDirectory(prefix="rfdetr-nano-seg-benchmark-") as tmp_dir:
+        baseline_result_path = str(Path(tmp_dir) / "baseline.json")
+        optimized_result_path = str(Path(tmp_dir) / "optimized.json")
+        baseline = _run_child_benchmark(
+            benchmark_profile="baseline",
+            flags=_BASELINE_FLAGS,
+            video_reference=resolved_video_reference,
+            model_id=model_id,
+            confidence=confidence,
+            backend=backend,
+            model_package_id=model_package_id,
+            result_out=baseline_result_path,
+        )
+        optimized = _run_child_benchmark(
+            benchmark_profile="optimized",
+            flags=_OPTIMIZED_FLAGS,
+            video_reference=resolved_video_reference,
+            model_id=model_id,
+            confidence=confidence,
+            backend=backend,
+            model_package_id=model_package_id,
+            result_out=optimized_result_path,
+        )
+
+    baseline_fps = baseline["fps"]
+    optimized_fps = optimized["fps"]
+    speedup = optimized_fps / baseline_fps if baseline_fps > 0 else 0.0
+    print("\n---- compare ----", flush=True)
+    print(
+        f"  baseline   frames={baseline['frames']} "
+        f"elapsed={baseline['elapsed']:.2f}s fps={baseline_fps:.2f}",
+        flush=True,
+    )
+    print(
+        f"  optimized  frames={optimized['frames']} "
+        f"elapsed={optimized['elapsed']:.2f}s fps={optimized_fps:.2f}",
+        flush=True,
+    )
+    print(f"  speedup    {speedup:.2f}x", flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=("run", "compare"),
+        default="run",
+        help=(
+            "run: single benchmark in this process. "
+            "compare: baseline then optimized, each in a fresh child process."
+        ),
+    )
+    parser.add_argument("--video_reference", required=True)
+    parser.add_argument("--model_id", default=_DEFAULT_MODEL_ID)
+    parser.add_argument("--confidence", type=float, default=0.4)
+    parser.add_argument(
+        "--backend",
+        choices=("trt", "onnx", "torch"),
+        default="trt",
+        help="inference-models backend.",
+    )
+    parser.add_argument(
+        "--model_package_id",
+        default=None,
+        help=(
+            "Registry package id to download and pin (via inference-models cache). "
+            "Overrides auto-negotiation and any cwd TRT package discovery."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-profile",
+        default="run",
+        help="Label for a single run (compare mode sets baseline/optimized in children).",
+    )
+    parser.add_argument(
+        "--result-out",
+        default=None,
+        help="Optional JSON path for the final benchmark result (used by compare mode).",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "compare":
+        do_compare(
+            video_reference=args.video_reference,
+            model_id=args.model_id,
+            confidence=args.confidence,
+            backend=args.backend,
+            model_package_id=args.model_package_id,
+        )
+        return
+
+    do_run(
+        video_reference=args.video_reference,
+        model_id=args.model_id,
+        confidence=args.confidence,
+        backend=args.backend,
+        model_package_id=args.model_package_id,
+        benchmark_profile=args.benchmark_profile,
+        result_out=args.result_out,
+    )
 
 
 if __name__ == "__main__":
