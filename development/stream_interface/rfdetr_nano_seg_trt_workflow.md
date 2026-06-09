@@ -144,3 +144,33 @@ AutoModel.describe_model("rfdetr-seg-nano")
 - TRT engines are hardware-specific — download and benchmark on the target device (e.g. Jetson Orin).
 - Use a persistent `INFERENCE_HOME` if you do not want the default `/tmp/cache` cleared on reboot.
 - `ROBOFLOW_API_KEY` is only required for private models; `rfdetr-seg-nano` is public.
+
+## Troubleshooting
+
+### `CorruptedModelPackageError: Could not find model config while attempting to load model from local directory`
+
+This can happen in `--mode compare` when the **baseline** child succeeds and the **optimized**
+child fails before inference starts.
+
+**Cause:** the baseline run materializes `rfdetr-seg-nano/1` (a symlink to the downloaded TRT
+package). That leaves a `rfdetr-seg-nano/` directory in the repo root. The optimized child then
+calls `AutoModel.from_pretrained("rfdetr-seg-nano", ...)` to fetch the same
+`--model_package_id`. Because `rfdetr-seg-nano/` already exists on disk, the loader treats it as
+a local package directory, looks for `rfdetr-seg-nano/model_config.json` (which is only under
+`rfdetr-seg-nano/1/`), and fails.
+
+**Fix:** use a current version of the script (it reuses the materialized package / cache path
+instead of re-fetching through the colliding alias). As a one-off workaround:
+
+```bash
+rm -rf rfdetr-seg-nano
+```
+
+Then re-run compare mode.
+
+### `Using an engine plan file across different models of devices is not supported`
+
+The pinned TRT package was built for a specific GPU (e.g. `nvidia-l4` in the registry
+metadata). Running it on a different device may work slowly or unreliably. Pick a
+`--model_package_id` that matches your hardware, or use `AutoModel.describe_model("rfdetr-seg-nano")`
+on the target machine to see compatible packages.

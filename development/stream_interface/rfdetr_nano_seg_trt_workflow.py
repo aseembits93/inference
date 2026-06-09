@@ -131,27 +131,73 @@ def _load_inference_pipeline(*, backend: str):
     return module.InferencePipeline
 
 
+def _is_valid_package_dir(package_dir: Path) -> bool:
+    return package_dir.is_dir() and (package_dir / "model_config.json").is_file()
+
+
+def _try_reuse_materialized_package(model_id: str, package_id: str) -> str | None:
+    from inference_models.models.auto_loaders.core import (
+        generate_model_package_cache_path,
+    )
+
+    candidates = (
+        Path(model_id) / "1",
+        Path(
+            generate_model_package_cache_path(
+                model_id=model_id,
+                package_id=package_id,
+            )
+        ),
+    )
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        package_dir = candidate.resolve()
+        if _is_valid_package_dir(package_dir):
+            return str(package_dir)
+    return None
+
+
+def _registry_model_id_for_fetch(model_id: str) -> str:
+    model_dir = Path(model_id)
+    if model_dir.is_dir() and not (model_dir / "model_config.json").is_file():
+        from inference.models.aliases import resolve_roboflow_model_alias
+
+        return resolve_roboflow_model_alias(model_id=model_id)
+    return model_id
+
+
 def _fetch_model_package(model_id: str, package_id: str, backend: str) -> str:
     from inference_models import AutoModel
+    from inference_models.models.auto_loaders.core import (
+        generate_model_package_cache_path,
+    )
 
+    fetch_model_id = _registry_model_id_for_fetch(model_id)
     package_dirs: list[str] = []
 
     def capture_package_dir(path: str) -> None:
         package_dirs.append(path)
 
     AutoModel.from_pretrained(
-        model_id_or_path=model_id,
+        model_id_or_path=fetch_model_id,
         backend=backend,
         model_package_id=package_id,
         verbose=True,
         point_model_directory=capture_package_dir,
     )
-    if not package_dirs:
-        raise RuntimeError(
-            f"Model package {package_id!r} for {model_id!r} did not report a cache path."
-        )
+    if package_dirs:
+        return package_dirs[0]
 
-    return package_dirs[0]
+    cache_dir = Path(
+        generate_model_package_cache_path(model_id=model_id, package_id=package_id)
+    )
+    if _is_valid_package_dir(cache_dir):
+        return str(cache_dir.resolve())
+
+    raise RuntimeError(
+        f"Model package {package_id!r} for {model_id!r} did not report a cache path."
+    )
 
 
 def _resolve_local_package(
@@ -161,6 +207,17 @@ def _resolve_local_package(
     model_package_id: str | None,
 ) -> str | None:
     if model_package_id is not None:
+        reused_package_dir = _try_reuse_materialized_package(
+            model_id=model_id,
+            package_id=model_package_id,
+        )
+        if reused_package_dir is not None:
+            print(
+                f"[model] reusing package_id={model_package_id} from {reused_package_dir}",
+                flush=True,
+            )
+            return reused_package_dir
+
         package_dir = _fetch_model_package(
             model_id=model_id,
             package_id=model_package_id,
