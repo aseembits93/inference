@@ -9,6 +9,11 @@ The `--backend` flag (trt | onnx | torch) is parsed before importing
 `DISABLED_INFERENCE_MODELS_BACKENDS` to every backend except the chosen one,
 so the benchmark numbers correspond unambiguously to a single execution path.
 
+Pass `--model_package_id` to download a specific registry package (cached under
+`$INFERENCE_HOME/models-cache/`) and run the benchmark against that artefact
+instead of auto-negotiation. A TRT package directory in the cwd is still used
+when present and `--model_package_id` is not set.
+
 Defaults: rfdetr-seg-nano @ confidence 0.4 on the native TRT backend.
 """
 
@@ -30,7 +35,6 @@ _ALL_BACKENDS = {
 }
 _DEFAULT_MODEL_ID = "rfdetr-seg-nano"
 _PREFERRED_LOCAL_TRT_PACKAGE = "rfdetr-seg-nano-orin-trt-package"
-_LOCAL_WORKFLOW_MODEL_ID = f"{_DEFAULT_MODEL_ID}/1"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _INFERENCE_MODELS_ROOT = _REPO_ROOT / "inference_models"
 
@@ -69,11 +73,6 @@ def _select_backend_from_argv() -> str:
 
 
 _BACKEND = _select_backend_from_argv()
-_LOCAL_TRT_PACKAGE = _find_local_trt_package() if _BACKEND == "trt" else None
-if _LOCAL_TRT_PACKAGE is not None:
-    os.environ.setdefault(
-        "ALLOW_INFERENCE_MODELS_DIRECTLY_ACCESS_LOCAL_PACKAGES", "True"
-    )
 os.environ.setdefault(
     "ONNXRUNTIME_EXECUTION_PROVIDERS",
     "[TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider]",
@@ -105,23 +104,72 @@ _LOCAL_INFERENCE_SPEC.loader.exec_module(_LOCAL_INFERENCE_MODULE)
 InferencePipeline = _LOCAL_INFERENCE_MODULE.InferencePipeline
 
 
-def _resolve_model_id(model_id: str, backend: str) -> str:
-    if backend == "trt" and model_id == _DEFAULT_MODEL_ID and _LOCAL_TRT_PACKAGE:
-        return _LOCAL_WORKFLOW_MODEL_ID
+def _fetch_model_package(model_id: str, package_id: str, backend: str) -> str:
+    from inference_models import AutoModel
+
+    package_dirs: list[str] = []
+
+    def capture_package_dir(path: str) -> None:
+        package_dirs.append(path)
+
+    AutoModel.from_pretrained(
+        model_id_or_path=model_id,
+        backend=backend,
+        model_package_id=package_id,
+        verbose=True,
+        point_model_directory=capture_package_dir,
+    )
+    if not package_dirs:
+        raise RuntimeError(
+            f"Model package {package_id!r} for {model_id!r} did not report a cache path."
+        )
+
+    return package_dirs[0]
+
+
+def _resolve_local_package(
+    *,
+    backend: str,
+    model_id: str,
+    model_package_id: str | None,
+) -> str | None:
+    if model_package_id is not None:
+        package_dir = _fetch_model_package(
+            model_id=model_id,
+            package_id=model_package_id,
+            backend=backend,
+        )
+        print(
+            f"[model] fetched package_id={model_package_id} from {package_dir}",
+            flush=True,
+        )
+        return package_dir
+
+    if backend == "trt":
+        return _find_local_trt_package()
+
+    return None
+
+
+def _resolve_model_id(model_id: str, local_package: str | None) -> str:
+    if local_package is not None:
+        return f"{model_id}/1"
     return model_id
 
 
-def _prepare_local_workflow_model_bundle(model_id: str) -> None:
-    if _LOCAL_TRT_PACKAGE is None or model_id != _LOCAL_WORKFLOW_MODEL_ID:
-        return
-
-    model_dir = Path(model_id)
+def _prepare_local_workflow_model_bundle(
+    workflow_model_id: str,
+    local_package: str,
+) -> None:
+    model_dir = Path(workflow_model_id)
     model_dir.parent.mkdir(parents=True, exist_ok=True)
-    target_dir = Path(_LOCAL_TRT_PACKAGE)
+    target_dir = Path(local_package)
     if not model_dir.exists():
         model_dir.symlink_to(target_dir, target_is_directory=True)
 
-    model_cache_dir = Path(os.environ.get("MODEL_CACHE_DIR", "/tmp/cache")) / model_id
+    model_cache_dir = (
+        Path(os.environ.get("MODEL_CACHE_DIR", "/tmp/cache")) / workflow_model_id
+    )
     model_cache_dir.mkdir(parents=True, exist_ok=True)
     model_type_path = model_cache_dir / "model_type.json"
     model_metadata = {
@@ -185,18 +233,43 @@ def main() -> None:
         default="trt",
         help="inference-models backend (consumed pre-import via env var).",
     )
+    parser.add_argument(
+        "--model_package_id",
+        default=None,
+        help=(
+            "Registry package id to download and pin (via inference-models cache). "
+            "Overrides auto-negotiation and any cwd TRT package discovery."
+        ),
+    )
     args = parser.parse_args()
-    model_id = _resolve_model_id(args.model_id, args.backend)
-    _prepare_local_workflow_model_bundle(model_id)
-    if model_id != args.model_id:
+    local_package = _resolve_local_package(
+        backend=args.backend,
+        model_id=args.model_id,
+        model_package_id=args.model_package_id,
+    )
+    if local_package is not None:
+        os.environ.setdefault(
+            "ALLOW_INFERENCE_MODELS_DIRECTLY_ACCESS_LOCAL_PACKAGES",
+            "True",
+        )
+
+    workflow_model_id = _resolve_model_id(
+        model_id=args.model_id,
+        local_package=local_package,
+    )
+    if local_package is not None:
+        _prepare_local_workflow_model_bundle(
+            workflow_model_id=workflow_model_id,
+            local_package=local_package,
+        )
         print(
-            f"[model] using local TRT package via workflow model id: {model_id}",
+            f"[model] using package via workflow model id: {workflow_model_id}",
             flush=True,
         )
 
     pipeline = InferencePipeline.init_with_workflow(
         video_reference=args.video_reference,
-        workflow_specification=build_workflow(model_id, args.confidence),
+        workflow_specification=build_workflow(workflow_model_id, args.confidence),
         on_prediction=sink,
     )
     pipeline.start()
