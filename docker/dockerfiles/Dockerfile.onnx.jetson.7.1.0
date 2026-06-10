@@ -313,6 +313,36 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache-jp71-ru
     libglib2.0-0 \
     libatomic1
 
+# Torch 2.10.0 on JP7.1 pairs with Triton 3.6.0.
+RUN set -eux; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
+        libxml2-dev \
+        ninja-build \
+        python3-dev \
+        zlib1g-dev; \
+    rm -rf /tmp/triton-build /tmp/triton-wheels; \
+    mkdir -p /tmp/triton-wheels; \
+    git clone --depth 1 --branch v3.6.0 https://github.com/triton-lang/triton.git /tmp/triton-build/src; \
+    git -C /tmp/triton-build/src submodule update --init --recursive; \
+    python3 -m pip install --break-system-packages --no-cache-dir \
+        -r /tmp/triton-build/src/python/requirements.txt; \
+    MAX_JOBS=4 python3 -m pip wheel --no-cache-dir \
+        --no-build-isolation \
+        --no-deps \
+        /tmp/triton-build/src \
+        --wheel-dir /tmp/triton-wheels; \
+    set -- /tmp/triton-wheels/triton-3.6.0*.whl; \
+    if [ ! -e "$1" ]; then \
+        echo "Expected source-built Triton wheel for 3.6.0 was not found" >&2; \
+        exit 1; \
+    fi; \
+    python3 -m pip install --break-system-packages --no-cache-dir "$1"; \
+    rm -rf /var/lib/apt/lists/* /tmp/triton-build /tmp/triton-wheels
+
 # Copy GDAL (skip headers - not needed in runtime)
 COPY --from=builder /usr/local/bin/gdal* /usr/local/bin/
 COPY --from=builder /usr/local/bin/ogr* /usr/local/bin/
