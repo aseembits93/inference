@@ -4,16 +4,20 @@ from io import BytesIO
 from time import perf_counter
 from typing import Any, List, Optional, Tuple, Union
 
+import cv2
 import numpy as np
+import supervision as sv
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from pycocotools import mask as mask_utils
+from supervision.config import CLASS_NAME_DATA_FIELD
 
 from inference.core.entities.requests import (
     ClassificationInferenceRequest,
     InferenceRequest,
 )
 from inference.core.entities.responses.inference import (
+    SV_DETECTIONS_FAST_ATTR,
     ClassificationInferenceResponse,
     InferenceResponse,
     InferenceResponseImage,
@@ -326,6 +330,10 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
 
+        is_workflow = (
+            kwargs.get("source") == "workflow-execution" and not return_in_rle
+        )
+
         responses: List[InstanceSegmentationInferenceResponse] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):
             H = preproc_metadata.original_size.height
@@ -333,6 +341,21 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
 
             xyxy = det.xyxy.detach().cpu().numpy()
             confs = det.confidence.detach().cpu().numpy()
+            class_ids = det.class_id.detach().cpu().numpy()
+
+            if is_workflow and isinstance(det.mask, torch.Tensor):
+                masks_np = det.mask.detach().cpu().numpy()
+                response = self._build_workflow_fastpath_response(
+                    xyxy=xyxy,
+                    confs=confs,
+                    class_ids=class_ids,
+                    masks=masks_np,
+                    width=W,
+                    height=H,
+                )
+                responses.append(response)
+                continue
+
             if isinstance(det.mask, torch.Tensor):
                 masks = det.mask.detach().cpu().numpy()
                 if return_in_rle:
@@ -346,7 +369,6 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                     polys_or_rles = det.mask.to_coco_rle_masks()
                 else:
                     polys_or_rles = rle_masks2poly(det.mask)
-            class_ids = det.class_id.detach().cpu().numpy()
 
             predictions: List[
                 Union[InstanceSegmentationPrediction, InstanceSegmentationRLEPrediction]
@@ -411,6 +433,85 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                 )
             )
         return responses
+
+    def _build_workflow_fastpath_response(
+        self,
+        xyxy: np.ndarray,
+        confs: np.ndarray,
+        class_ids: np.ndarray,
+        masks: np.ndarray,
+        width: int,
+        height: int,
+    ) -> InstanceSegmentationInferenceResponse:
+        n = int(class_ids.shape[0]) if class_ids.ndim else 0
+        class_names_map = self.class_names
+        n_classes = len(class_names_map)
+
+        if n == 0:
+            sv_dets = sv.Detections.empty()
+            sv_dets.data = {CLASS_NAME_DATA_FIELD: np.empty(0, dtype=object)}
+        else:
+            # Reproduce the slow path's mask denoising: per mask, keep only
+            # the largest external contour (by vertex count) and refill it,
+            # which filters disconnected mask fragments AND fills interior
+            # holes (RETR_EXTERNAL ignores inner contours). Detections whose
+            # largest contour has fewer than 3 vertices are dropped, matching
+            # `filter_out_invalid_polygons` + the `>= 3` check in
+            # supervision's `process_roboflow_result`.
+            denoised = np.zeros_like(masks, dtype=np.uint8)
+            keep_mask = np.zeros(n, dtype=bool)
+            for i in range(n):
+                m = masks[i]
+                if m.dtype == np.bool_:
+                    m = m.view(np.uint8)
+                elif m.dtype != np.uint8:
+                    m = (m > 0).astype(np.uint8)
+                if not m.flags.c_contiguous:
+                    m = np.ascontiguousarray(m)
+                contours = cv2.findContours(
+                    m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )[0]
+                if not contours:
+                    continue
+                best = max(contours, key=len)
+                # Match supervision's `>= 3` threshold on polygon vertex count.
+                if len(best) < 3:
+                    continue
+                cv2.fillPoly(denoised[i], [best.reshape(-1, 2)], color=1)
+                keep_mask[i] = True
+
+            class_id_int = class_ids.astype(np.int64, copy=False)
+            class_name_arr = np.empty(n, dtype=object)
+            for i, cid in enumerate(class_id_int):
+                ci = int(cid)
+                class_name_arr[i] = (
+                    class_names_map[ci] if 0 <= ci < n_classes else str(ci)
+                )
+
+            if not keep_mask.all():
+                xyxy = xyxy[keep_mask]
+                confs = confs[keep_mask]
+                class_id_int = class_id_int[keep_mask]
+                class_name_arr = class_name_arr[keep_mask]
+                denoised = denoised[keep_mask]
+
+            mask_bool = denoised.astype(bool, copy=False)
+            sv_dets = sv.Detections(
+                xyxy=xyxy.astype(np.float32, copy=False),
+                confidence=confs.astype(np.float32, copy=False),
+                class_id=class_id_int,
+                mask=mask_bool if mask_bool.size else None,
+                data={CLASS_NAME_DATA_FIELD: class_name_arr},
+            )
+
+        response = InstanceSegmentationInferenceResponse(
+            predictions=[],
+            image=InferenceResponseImage(width=width, height=height),
+        )
+        # Pydantic v2 ignores extra __dict__ keys in model_dump and
+        # jsonable_encoder, so this never leaks into serialized output.
+        response.__dict__[SV_DETECTIONS_FAST_ATTR] = sv_dets
+        return response
 
     def clear_cache(self, delete_from_disk: bool = True) -> None:
         """Clears any cache if necessary. TODO: Implement this to delete the cache from the experimental model.
