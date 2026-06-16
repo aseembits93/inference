@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -220,6 +220,7 @@ class FastPreprocessRuntime:
     def __init__(self, device: torch.device) -> None:
         self._device = device
         self._state: Optional[FastPreprocessState] = None
+        self._states: Dict[Tuple[int, int, int, int], FastPreprocessState] = {}
         self._warned_reasons: set[str] = set()
 
     def try_preprocess(
@@ -234,9 +235,8 @@ class FastPreprocessRuntime:
         """Enqueue Triton preprocessing when the request is supported.
 
         Args:
-            images: Single uint8 HWC numpy image, or a single-item list
-                containing one. Batch sizes greater than one use the reference
-                preprocessing path.
+            images: Single uint8 HWC numpy image, or a homogeneous list of
+                uint8 HWC numpy images.
             input_color_format: Caller-provided image color order. ``None`` is
                 treated as BGR, matching the model adapter default.
             image_size: Per-call size override. Overrides are rejected because
@@ -262,12 +262,13 @@ class FastPreprocessRuntime:
             image_size=image_size,
             image_pre_processing=image_pre_processing,
             network_input=network_input,
+            stream=stream,
         )
         if unsupported_reason is not None:
             self._warn_unsupported(unsupported_reason)
             return None
 
-        candidate = images[0] if isinstance(images, list) else images
+        candidates = images if isinstance(images, list) else [images]
         caller_mode = (
             ColorMode(input_color_format)
             if input_color_format is not None
@@ -280,15 +281,73 @@ class FastPreprocessRuntime:
         stds_t = (float(stds[0]), float(stds[1]), float(stds[2]))
         target_h = network_input.training_input_size.height
         target_w = network_input.training_input_size.width
-        orig_h, orig_w = int(candidate.shape[0]), int(candidate.shape[1])
 
-        state = self._state
-        if state is None or state.is_stale(
-            src_h=orig_h,
-            src_w=orig_w,
-            target_h=target_h,
-            target_w=target_w,
-        ):
+        metadata = []
+        used_pinned_hosts = []
+        with torch.cuda.stream(stream):
+            if len(candidates) == 1:
+                out_tensor, image_metadata, pinned_host = self._enqueue_image(
+                    candidate=candidates[0],
+                    stream=stream,
+                    target_h=target_h,
+                    target_w=target_w,
+                    means=means_t,
+                    stds=stds_t,
+                    swap_rb=swap_rb,
+                )
+                result_tensor = out_tensor
+                metadata.append(image_metadata)
+                used_pinned_hosts.append(pinned_host)
+            else:
+                result_tensor = torch.empty(
+                    (len(candidates), 3, target_h, target_w),
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+                for image_index, candidate in enumerate(candidates):
+                    out_tensor, image_metadata, pinned_host = self._enqueue_image(
+                        candidate=candidate,
+                        stream=stream,
+                        target_h=target_h,
+                        target_w=target_w,
+                        means=means_t,
+                        stds=stds_t,
+                        swap_rb=swap_rb,
+                    )
+                    result_tensor[image_index].copy_(
+                        out_tensor[0],
+                        non_blocking=True,
+                    )
+                    metadata.append(image_metadata)
+                    used_pinned_hosts.append(pinned_host)
+            ready_event = torch.cuda.Event()
+            ready_event.record(stream)
+            result_tensor._trt_ready_event = ready_event  # type: ignore[attr-defined]
+            for pinned_host in used_pinned_hosts:
+                pinned_host._preproc_ready_event = ready_event  # type: ignore[attr-defined]
+            result_tensor.record_stream(stream)
+
+        result_tensor._pre_processing_meta = metadata  # type: ignore[attr-defined]
+        return FastPreprocessResult(
+            tensor=result_tensor,
+            metadata=metadata,
+            ready_event=ready_event,
+        )
+
+    def _enqueue_image(
+        self,
+        candidate: np.ndarray,
+        stream: torch.cuda.Stream,
+        target_h: int,
+        target_w: int,
+        means: Tuple[float, float, float],
+        stds: Tuple[float, float, float],
+        swap_rb: bool,
+    ) -> Tuple[torch.Tensor, PreProcessingMetadata, torch.Tensor]:
+        orig_h, orig_w = int(candidate.shape[0]), int(candidate.shape[1])
+        state_key = (orig_h, orig_w, target_h, target_w)
+        state = self._states.get(state_key)
+        if state is None:
             state = FastPreprocessState.build(
                 src_h=orig_h,
                 src_w=orig_w,
@@ -296,7 +355,8 @@ class FastPreprocessRuntime:
                 target_w=target_w,
                 device=self._device,
             )
-            self._state = state
+            self._states[state_key] = state
+        self._state = state
 
         pinned_host, src_gpu, out_buffer, tmp_buffer = state.next_buffers()
         preproc_ready_event = getattr(pinned_host, "_preproc_ready_event", None)
@@ -304,57 +364,44 @@ class FastPreprocessRuntime:
             preproc_ready_event.synchronize()
         np.copyto(pinned_host.numpy(), candidate, casting="no")
 
-        with torch.cuda.stream(stream):
-            trt_consumed_event = getattr(out_buffer, "_trt_consumed_event", None)
-            if trt_consumed_event is not None:
-                stream.wait_event(trt_consumed_event)
-            src_gpu.copy_(pinned_host, non_blocking=True)
-            triton_preprocess_rfdetr_stretch_two_pass_preallocated(
-                src=src_gpu,
-                out=out_buffer,
-                tmp=tmp_buffer,
-                tables=state.tables,
-                target_h=target_h,
-                target_w=target_w,
-                means=means_t,
-                stds=stds_t,
-                swap_rb=swap_rb,
-                launch_config=state.launch_config,
-            )
-            ready_event = torch.cuda.Event()
-            ready_event.record(stream)
-            out_buffer._trt_ready_event = ready_event  # type: ignore[attr-defined]
-            pinned_host._preproc_ready_event = ready_event  # type: ignore[attr-defined]
-            out_buffer.record_stream(stream)
-
-        metadata = [
-            PreProcessingMetadata(
-                pad_left=0,
-                pad_top=0,
-                pad_right=0,
-                pad_bottom=0,
-                original_size=ImageDimensions(width=orig_w, height=orig_h),
-                size_after_pre_processing=ImageDimensions(
-                    width=orig_w,
-                    height=orig_h,
-                ),
-                inference_size=ImageDimensions(width=target_w, height=target_h),
-                scale_width=target_w / orig_w,
-                scale_height=target_h / orig_h,
-                static_crop_offset=StaticCropOffset(
-                    offset_x=0,
-                    offset_y=0,
-                    crop_width=orig_w,
-                    crop_height=orig_h,
-                ),
-            )
-        ]
-        out_buffer._pre_processing_meta = metadata  # type: ignore[attr-defined]
-        return FastPreprocessResult(
-            tensor=out_buffer,
-            metadata=metadata,
-            ready_event=ready_event,
+        trt_consumed_event = getattr(out_buffer, "_trt_consumed_event", None)
+        if trt_consumed_event is not None:
+            stream.wait_event(trt_consumed_event)
+        src_gpu.copy_(pinned_host, non_blocking=True)
+        triton_preprocess_rfdetr_stretch_two_pass_preallocated(
+            src=src_gpu,
+            out=out_buffer,
+            tmp=tmp_buffer,
+            tables=state.tables,
+            target_h=target_h,
+            target_w=target_w,
+            means=means,
+            stds=stds,
+            swap_rb=swap_rb,
+            launch_config=state.launch_config,
         )
+        out_buffer.record_stream(stream)
+        metadata = PreProcessingMetadata(
+            pad_left=0,
+            pad_top=0,
+            pad_right=0,
+            pad_bottom=0,
+            original_size=ImageDimensions(width=orig_w, height=orig_h),
+            size_after_pre_processing=ImageDimensions(
+                width=orig_w,
+                height=orig_h,
+            ),
+            inference_size=ImageDimensions(width=target_w, height=target_h),
+            scale_width=target_w / orig_w,
+            scale_height=target_h / orig_h,
+            static_crop_offset=StaticCropOffset(
+                offset_x=0,
+                offset_y=0,
+                crop_width=orig_w,
+                crop_height=orig_h,
+            ),
+        )
+        return out_buffer, metadata, pinned_host
 
     def _unsupported_reason(
         self,
@@ -362,6 +409,7 @@ class FastPreprocessRuntime:
         image_size: Optional[Tuple[int, int]],
         image_pre_processing: ImagePreProcessing,
         network_input: NetworkInputDefinition,
+        stream: Optional[torch.cuda.Stream],
     ) -> Optional[str]:
         """Explain why the request must use the reference preprocessing path."""
         if not _TRITON_AVAILABLE:
@@ -406,20 +454,20 @@ class FastPreprocessRuntime:
         ):
             return f"resize mode {network_input.resize_mode!r} is unsupported"
 
-        if isinstance(images, list):
-            if len(images) != 1:
-                return "only batch size 1 is supported"
-            candidate = images[0]
-        else:
-            candidate = images
-        if not isinstance(candidate, np.ndarray):
-            return "only numpy ndarray inputs are supported"
-        if (
-            candidate.dtype != np.uint8
-            or candidate.ndim != 3
-            or candidate.shape[2] != 3
-        ):
-            return "input must be uint8 HWC with 3 channels"
+        candidates = images if isinstance(images, list) else [images]
+        if not candidates:
+            return "at least one image is required"
+        for candidate in candidates:
+            if not isinstance(candidate, np.ndarray):
+                return "only numpy ndarray inputs are supported"
+            if (
+                candidate.dtype != np.uint8
+                or candidate.ndim != 3
+                or candidate.shape[2] != 3
+            ):
+                return "input must be uint8 HWC with 3 channels"
+        if stream is None:
+            return "CUDA stream is required"
         return None
 
     def _warn_unsupported(self, reason: str) -> None:

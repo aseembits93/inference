@@ -93,41 +93,51 @@ def _reference_preprocess(image_rgb: np.ndarray, target_h: int, target_w: int):
     return tensor.unsqueeze(0)
 
 
-def test_trt_fast_preprocess_warns_once_for_unsupported_batch(
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not triton_preprocess.TRITON_AVAILABLE,
+    reason="CUDA and Triton are required",
+)
+def test_trt_fast_preprocess_matches_reference_for_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(triton_preprocess_runtime, "_FAST_PATH_ENABLED", True)
     monkeypatch.setattr(triton_preprocess_runtime, "_TRITON_AVAILABLE", True)
+    target_h, target_w = 64, 64
     runtime = FastPreprocessRuntime(device=torch.device("cuda"))
-    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    stream = torch.cuda.Stream(device=torch.device("cuda"))
+    rng = np.random.default_rng(seed=73)
+    images_rgb = [
+        rng.integers(0, 256, size=(96, 80, 3), dtype=np.uint8),
+        rng.integers(0, 256, size=(80, 96, 3), dtype=np.uint8),
+    ]
+    images_bgr = [image[:, :, ::-1].copy() for image in images_rgb]
 
-    with pytest.warns(RuntimeWarning, match="only batch size 1 is supported"):
-        assert (
-            runtime.try_preprocess(
-                images=[image, image],
-                input_color_format="bgr",
-                image_size=None,
-                image_pre_processing=ImagePreProcessing(),
-                network_input=_network_input(),
-                stream=None,
-            )
-            is None
-        )
+    result = runtime.try_preprocess(
+        images=images_bgr,
+        input_color_format="bgr",
+        image_size=None,
+        image_pre_processing=ImagePreProcessing(),
+        network_input=_network_input(target_h=target_h, target_w=target_w),
+        stream=stream,
+    )
+    assert result is not None
+    result.ready_event.synchronize()
 
-    with warnings.catch_warnings(record=True) as recorded:
-        warnings.simplefilter("always")
-        assert (
-            runtime.try_preprocess(
-                images=[image, image],
-                input_color_format="bgr",
-                image_size=None,
-                image_pre_processing=ImagePreProcessing(),
-                network_input=_network_input(),
-                stream=None,
+    expected = torch.cat(
+        [
+            _reference_preprocess(
+                image_rgb,
+                target_h=target_h,
+                target_w=target_w,
             )
-            is None
-        )
-    assert recorded == []
+            for image_rgb in images_rgb
+        ],
+        dim=0,
+    )
+    torch.testing.assert_close(result.tensor.cpu(), expected, atol=1e-6, rtol=0)
+    assert result.tensor.shape[0] == 2
+    assert len(result.metadata) == 2
+    assert result.tensor._pre_processing_meta == result.metadata  # type: ignore[attr-defined]
 
 
 def test_trt_fast_preprocess_flag_disabled_returns_none_without_warning(

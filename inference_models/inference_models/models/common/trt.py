@@ -647,11 +647,17 @@ def _infer_from_trt_engine_with_batch_size_boundaries(
             synchronize=synchronize,
         )
         if reminder > 0:
+            source_results = results
             results = [r[:-reminder] for r in results]
+            _copy_trt_runtime_metadata(
+                source_results=source_results,
+                target_results=results,
+            )
         return results
     all_results = []
     for _ in outputs:
         all_results.append([])
+    graph_results_were_cloned = False
     for i in range(0, pre_processed_images.shape[0], max_batch_size):
         batch = pre_processed_images[i : i + max_batch_size].contiguous()
         reminder = min_batch_size - batch.shape[0]
@@ -677,11 +683,75 @@ def _infer_from_trt_engine_with_batch_size_boundaries(
             trt_cuda_graph_cache=trt_cuda_graph_cache,
             synchronize=synchronize,
         )
+        if not synchronize:
+            results, graph_results_cloned = _clone_trt_graph_results_for_split_batch(
+                results=results,
+                device=device,
+            )
+            graph_results_were_cloned = (
+                graph_results_were_cloned or graph_results_cloned
+            )
         if reminder > 0:
             results = [r[:-reminder] for r in results]
         for partial_result, all_result_element in zip(results, all_results):
             all_result_element.append(partial_result)
-    return [torch.cat(e, dim=0).contiguous() for e in all_results]
+    results = [torch.cat(e, dim=0).contiguous() for e in all_results]
+    if graph_results_were_cloned:
+        produce_event = torch.cuda.Event()
+        produce_event.record(torch.cuda.current_stream(device))
+        _attach_trt_produce_event_metadata(
+            results=results,
+            produce_event=produce_event,
+        )
+    return results
+
+
+def _copy_trt_runtime_metadata(
+    source_results: List[torch.Tensor],
+    target_results: List[torch.Tensor],
+) -> None:
+    if not source_results or not target_results:
+        return None
+    produce_event = getattr(source_results[0], "_trt_produce_event", None)
+    if produce_event is None:
+        return None
+    graph_state = getattr(source_results[0], "_trt_graph_state", None)
+    if graph_state is None:
+        _attach_trt_produce_event_metadata(
+            results=target_results,
+            produce_event=produce_event,
+        )
+        return None
+    _attach_trt_graph_metadata(
+        results=target_results,
+        trt_cuda_graph_state=graph_state,
+        produce_event=produce_event,
+    )
+
+
+def _clone_trt_graph_results_for_split_batch(
+    results: List[torch.Tensor],
+    device: torch.device,
+) -> Tuple[List[torch.Tensor], bool]:
+    if not results:
+        return results, False
+    graph_state = getattr(results[0], "_trt_graph_state", None)
+    produce_event = getattr(results[0], "_trt_produce_event", None)
+    if graph_state is None or produce_event is None:
+        return results, False
+    stream = torch.cuda.current_stream(device)
+    stream.wait_event(produce_event)
+    clones = [result.clone() for result in results]
+    clone_done_event = torch.cuda.Event()
+    clone_done_event.record(stream)
+    graph_states_by_id = {
+        id(state): state
+        for state in (getattr(result, "_trt_graph_state", None) for result in results)
+        if state is not None
+    }
+    for state in graph_states_by_id.values():
+        state.consumer_done_event = clone_done_event
+    return clones, True
 
 
 def _execute_trt_engine(
@@ -908,6 +978,14 @@ def _attach_trt_graph_metadata(
 ) -> None:
     for result in results:
         result._trt_graph_state = trt_cuda_graph_state  # type: ignore[attr-defined]
+        result._trt_produce_event = produce_event  # type: ignore[attr-defined]
+
+
+def _attach_trt_produce_event_metadata(
+    results: List[torch.Tensor],
+    produce_event: torch.cuda.Event,
+) -> None:
+    for result in results:
         result._trt_produce_event = produce_event  # type: ignore[attr-defined]
 
 

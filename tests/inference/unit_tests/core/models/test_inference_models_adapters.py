@@ -22,6 +22,7 @@ from inference_models import (
     InstanceDetections,
     MultiLabelClassificationPrediction,
 )
+from inference_models.models.base.async_handoff import get_async_response_future
 
 
 class _ImmediateExecutor:
@@ -77,6 +78,27 @@ class _FakePipelineModel:
         return ["sync-detections"]
 
 
+class _FakeSyncModel:
+    supported_mask_formats = {"rle"}
+
+    def __init__(self) -> None:
+        self.forward_calls = []
+        self.forward_async_calls = []
+        self.post_process_calls = []
+
+    def forward(self, img_in, **kwargs):
+        self.forward_calls.append((img_in, kwargs))
+        return "sync-raw"
+
+    def forward_async(self, img_in, meta, **kwargs):
+        self.forward_async_calls.append((img_in, meta, kwargs))
+        raise AssertionError("forward_async should not be used")
+
+    def post_process(self, predictions, meta, **kwargs):
+        self.post_process_calls.append((predictions, meta, kwargs))
+        return ["sync-detections"]
+
+
 def _make_meta(tag: str):
     return [
         SimpleNamespace(
@@ -86,9 +108,8 @@ def _make_meta(tag: str):
     ]
 
 
-def _make_pipeline_adapter(
-    futures: list[_FakePipelineFuture],
-    ops: list[str],
+def _make_adapter(
+    model,
     pipeline_depth: int = 2,
 ) -> InferenceModelsInstanceSegmentationAdapter:
     adapter = object.__new__(InferenceModelsInstanceSegmentationAdapter)
@@ -98,7 +119,7 @@ def _make_pipeline_adapter(
     adapter._pending_futures = deque()
     adapter._response_futures = deque()
     adapter._response_executor = None
-    adapter._model = _FakePipelineModel(futures=futures, ops=ops)
+    adapter._model = model
     adapter.class_names = []
     adapter.map_inference_kwargs = lambda kwargs: dict(kwargs)
     adapter._get_response_executor = lambda: _ImmediateExecutor()
@@ -109,6 +130,17 @@ def _make_pipeline_adapter(
     )
 
     return adapter
+
+
+def _make_pipeline_adapter(
+    futures: list[_FakePipelineFuture],
+    ops: list[str],
+    pipeline_depth: int = 2,
+) -> InferenceModelsInstanceSegmentationAdapter:
+    return _make_adapter(
+        model=_FakePipelineModel(futures=futures, ops=ops),
+        pipeline_depth=pipeline_depth,
+    )
 
 
 def test_pipeline_depth_falls_back_to_one_for_unsupported_models(monkeypatch) -> None:
@@ -135,7 +167,7 @@ def test_pipeline_depth_honors_requested_depth_for_supported_models(
     assert adapter._resolve_pipeline_depth() == 3
 
 
-def test_pipeline_uses_sync_forward_for_batched_requests() -> None:
+def test_pipeline_uses_async_forward_for_batched_requests() -> None:
     ops: list[str] = []
     future = _FakePipelineFuture(name="f1", ops=ops)
     adapter = _make_pipeline_adapter(
@@ -147,17 +179,20 @@ def test_pipeline_uses_sync_forward_for_batched_requests() -> None:
 
     result = adapter.predict(img_in, response_mask_format="dense")
 
-    assert result == "sync-raw"
-    assert ops == []
-    assert len(adapter._model.forward_calls) == 1
+    assert result is future
+    assert ops == ["forward:f1", "submit:f1"]
 
 
 def test_pipeline_postprocess_uses_sync_path_for_non_future_predictions() -> None:
-    ops: list[str] = []
-    adapter = _make_pipeline_adapter(
-        futures=[],
-        ops=ops,
-        pipeline_depth=2,
+    model = _FakeSyncModel()
+    adapter = _make_adapter(model=model, pipeline_depth=2)
+    adapter._build_responses_from_detections = (
+        lambda detections, preprocess_return_metadata, **_kwargs: [
+            {
+                "tag": preprocess_return_metadata[0].tag,
+                "detections": detections,
+            }
+        ]
     )
 
     responses = adapter.postprocess(
@@ -166,9 +201,39 @@ def test_pipeline_postprocess_uses_sync_path_for_non_future_predictions() -> Non
         response_mask_format="dense",
     )
 
-    assert responses == ["meta-1"]
-    assert len(adapter._model.post_process_calls) == 1
-    assert adapter._model.post_process_calls[0][0] == "sync-raw"
+    assert responses == [{"tag": "meta-1", "detections": ["sync-detections"]}]
+    assert len(model.post_process_calls) == 1
+    assert model.post_process_calls[0][0] == "sync-raw"
+
+
+def test_pipeline_batched_request_submits_response_without_waiting_for_next_frame() -> (
+    None
+):
+    ops: list[str] = []
+    future = _FakePipelineFuture(name="f1", ops=ops)
+    adapter = _make_pipeline_adapter(
+        futures=[future],
+        ops=ops,
+        pipeline_depth=2,
+    )
+    adapter._build_responses_from_detections = (
+        lambda _detections, preprocess_return_metadata, **_kwargs: [
+            metadata.tag for metadata in preprocess_return_metadata
+        ]
+    )
+
+    prediction = adapter.predict("batch", response_mask_format="dense")
+    responses = adapter.postprocess(
+        prediction,
+        _make_meta("meta-1") + _make_meta("meta-2"),
+        response_mask_format="dense",
+        source="workflow-execution",
+    )
+
+    assert ops == ["forward:f1", "submit:f1", "result:f1"]
+    async_response_future = get_async_response_future(responses[0])
+    assert isinstance(async_response_future, Future)
+    assert async_response_future.result() == ["meta-1", "meta-2"]
 
 
 def test_workflow_response_fast_dataclass_path_is_disabled_at_depth_one() -> None:

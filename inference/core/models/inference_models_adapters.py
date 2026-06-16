@@ -411,24 +411,11 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         mapped_kwargs = self.map_inference_kwargs(kwargs)
         return self._model.pre_process(np_images, **mapped_kwargs)
 
-    def _request_batch_size(self, img_in: Any) -> int:
-        pre_processing_meta = getattr(img_in, "_pre_processing_meta", None)
-        if isinstance(pre_processing_meta, (list, tuple)):
-            return len(pre_processing_meta)
-        shape = getattr(img_in, "shape", None)
-        if shape is not None and len(shape) > 0:
-            return int(shape[0])
-        if isinstance(img_in, (list, tuple)):
-            return len(img_in)
-        return 1
-
     def predict(self, img_in, **kwargs):
         mapped_kwargs = self.map_inference_kwargs(kwargs)
         if self._pipeline_depth <= 1:
             # Original path: forward on current frame, postprocess on
             # current frame, all synchronous.
-            return self._model.forward(img_in, **mapped_kwargs)
-        if self._request_batch_size(img_in) > 1:
             return self._model.forward(img_in, **mapped_kwargs)
 
         mapped_kwargs["defer_count_to_adapter"] = (
@@ -536,6 +523,11 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         while self._pending_futures:
             self._submit_response_build(*self._pending_futures.popleft())
 
+    def _metadata_batch_size(self, preprocess_return_metadata: Any) -> int:
+        if isinstance(preprocess_return_metadata, (list, tuple)):
+            return len(preprocess_return_metadata)
+        return 1
+
     def postprocess(
         self,
         predictions,
@@ -556,7 +548,15 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             )
         )
         self._pending_futures.append((fut, preprocess_return_metadata, mapped_kwargs))
-        if len(self._pending_futures) > self._response_delay:
+        one_shot_batched_request = (
+            self._metadata_batch_size(preprocess_return_metadata) > 1
+            and len(self._pending_futures) == 1
+            and not self._response_futures
+        )
+        if one_shot_batched_request:
+            self._submit_all_pending_gpu_work()
+            self._submit_all_pending_responses()
+        elif len(self._pending_futures) > self._response_delay:
             self._submit_next_pending_gpu_work()
             self._submit_ready_responses()
 
