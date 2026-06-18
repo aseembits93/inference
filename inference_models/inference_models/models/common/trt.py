@@ -1,4 +1,5 @@
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -79,6 +80,38 @@ class TRTCudaGraphState:
     output_buffers: List[torch.Tensor]
     execution_context: trt.IExecutionContext
     consumer_done_event: Optional[torch.cuda.Event] = None
+    outputs_in_use: bool = False
+
+
+@dataclass
+class TRTCudaGraphStateRing:
+    states: List[TRTCudaGraphState]
+    next_index: int = 0
+
+    def acquire(self) -> TRTCudaGraphState:
+        while True:
+            for offset in range(len(self.states)):
+                idx = (self.next_index + offset) % len(self.states)
+                state = self.states[idx]
+                if _trt_cuda_graph_outputs_available(state):
+                    self.next_index = (idx + 1) % len(self.states)
+                    return state
+
+            for offset in range(len(self.states)):
+                idx = (self.next_index + offset) % len(self.states)
+                state = self.states[idx]
+                if state.consumer_done_event is not None:
+                    self.next_index = (idx + 1) % len(self.states)
+                    return state
+
+            # Every slot is in use, but postprocess has not yet attached the
+            # consumer event for any slot. Yield briefly until the async
+            # postprocess submitter records one; reusing now would corrupt raw
+            # graph outputs.
+            time.sleep(0.0001)
+
+
+_ASYNC_CUDA_GRAPH_RING_SIZE = 3
 
 
 class TRTCudaGraphCache:
@@ -119,7 +152,7 @@ class TRTCudaGraphCache:
 
     def __init__(self, capacity: int):
         self._cache: OrderedDict[
-            Tuple[Tuple[int, ...], torch.dtype, torch.device], TRTCudaGraphState
+            Tuple[Tuple[int, ...], torch.dtype, torch.device], TRTCudaGraphStateRing
         ] = OrderedDict()
         self._capacity = capacity
         self._state_lock = threading.RLock()
@@ -245,7 +278,7 @@ class TRTCudaGraphCache:
 
     def __getitem__(
         self, key: Tuple[Tuple[int, ...], torch.dtype, torch.device]
-    ) -> TRTCudaGraphState:
+    ) -> TRTCudaGraphStateRing:
         with self._state_lock:
             value = self._cache[key]
             self._cache.move_to_end(key)
@@ -254,7 +287,7 @@ class TRTCudaGraphCache:
     def __setitem__(
         self,
         key: Tuple[Tuple[int, ...], torch.dtype, torch.device],
-        value: TRTCudaGraphState,
+        value: TRTCudaGraphStateRing,
     ):
         with self._state_lock:
             self._cache[key] = value
@@ -263,11 +296,14 @@ class TRTCudaGraphCache:
                 _, evicted = self._cache.popitem(last=False)
                 self._evict(evicted=evicted)
 
-    def _evict(self, evicted: TRTCudaGraphState, empty_cuda_cache: bool = True) -> None:
-        del evicted.cuda_graph
-        del evicted.input_buffer
-        del evicted.output_buffers
-        del evicted.execution_context
+    def _evict(
+        self, evicted: TRTCudaGraphStateRing, empty_cuda_cache: bool = True
+    ) -> None:
+        for state in evicted.states:
+            del state.cuda_graph
+            del state.input_buffer
+            del state.output_buffers
+            del state.execution_context
         if empty_cuda_cache:
             torch.cuda.empty_cache()
 
@@ -698,6 +734,7 @@ def _execute_trt_engine(
         input_shape = tuple(pre_processed_images.shape)
         input_dtype = pre_processed_images.dtype
         cache_key = (input_shape, input_dtype, device)
+        target_ring_size = _ASYNC_CUDA_GRAPH_RING_SIZE if not synchronize else 1
 
         if cache_key not in trt_cuda_graph_cache:
             LOGGER.debug("Capturing CUDA graph for shape %s", input_shape)
@@ -714,14 +751,43 @@ def _execute_trt_engine(
                 use_pre_processed_images_as_input_buffer=bool(use_external),
                 clone_outputs=synchronize,
             )
-            trt_cuda_graph_cache[cache_key] = trt_cuda_graph
+            states = [trt_cuda_graph]
+            for _ in range(1, target_ring_size):
+                _, extra_graph = _capture_cuda_graph(
+                    pre_processed_images=pre_processed_images,
+                    engine=engine,
+                    device=device,
+                    input_name=input_name,
+                    outputs=outputs,
+                    use_pre_processed_images_as_input_buffer=False,
+                    clone_outputs=True,
+                )
+                states.append(extra_graph)
+            trt_cuda_graph_ring = TRTCudaGraphStateRing(
+                states=states,
+                next_index=1 % len(states),
+            )
+            trt_cuda_graph_cache[cache_key] = trt_cuda_graph_ring
+            if not synchronize:
+                _mark_trt_cuda_graph_outputs_in_use(trt_cuda_graph)
             return results
 
         else:
-            trt_cuda_graph_state = trt_cuda_graph_cache[cache_key]
+            trt_cuda_graph_ring = trt_cuda_graph_cache[cache_key]
+            if len(trt_cuda_graph_ring.states) < target_ring_size:
+                _grow_trt_cuda_graph_ring(
+                    trt_cuda_graph_ring=trt_cuda_graph_ring,
+                    target_size=target_ring_size,
+                    pre_processed_images=pre_processed_images,
+                    engine=engine,
+                    device=device,
+                    input_name=input_name,
+                    outputs=outputs,
+                )
+            trt_cuda_graph_state = trt_cuda_graph_ring.acquire()
             stream = trt_cuda_graph_state.cuda_stream
             consumer_done = trt_cuda_graph_state.consumer_done_event
-            if consumer_done is not None:
+            if trt_cuda_graph_state.outputs_in_use and consumer_done is not None:
                 stream.wait_event(consumer_done)
             input_ready = getattr(pre_processed_images, "_trt_ready_event", None)
             with torch.cuda.stream(stream):
@@ -757,6 +823,9 @@ def _execute_trt_engine(
                 produce_event.record(stream)
             if synchronize:
                 stream.synchronize()
+                trt_cuda_graph_state.outputs_in_use = False
+            else:
+                _mark_trt_cuda_graph_outputs_in_use(trt_cuda_graph_state)
             _attach_trt_graph_metadata(
                 results=results,
                 trt_cuda_graph_state=trt_cuda_graph_state,
@@ -796,6 +865,43 @@ def _execute_trt_engine(
                 help_url="https://inference-models.roboflow.com/errors/models-runtime/#modelruntimeerror",
             )
         return results
+
+
+def _trt_cuda_graph_outputs_available(state: TRTCudaGraphState) -> bool:
+    if not state.outputs_in_use:
+        return True
+    consumer_done = state.consumer_done_event
+    if consumer_done is not None and consumer_done.query():
+        state.outputs_in_use = False
+        return True
+    return False
+
+
+def _mark_trt_cuda_graph_outputs_in_use(state: TRTCudaGraphState) -> None:
+    state.outputs_in_use = True
+    state.consumer_done_event = None
+
+
+def _grow_trt_cuda_graph_ring(
+    trt_cuda_graph_ring: TRTCudaGraphStateRing,
+    target_size: int,
+    pre_processed_images: torch.Tensor,
+    engine: trt.ICudaEngine,
+    device: torch.device,
+    input_name: str,
+    outputs: List[str],
+) -> None:
+    while len(trt_cuda_graph_ring.states) < target_size:
+        _, extra_graph = _capture_cuda_graph(
+            pre_processed_images=pre_processed_images,
+            engine=engine,
+            device=device,
+            input_name=input_name,
+            outputs=outputs,
+            use_pre_processed_images_as_input_buffer=False,
+            clone_outputs=True,
+        )
+        trt_cuda_graph_ring.states.append(extra_graph)
 
 
 def _capture_cuda_graph(

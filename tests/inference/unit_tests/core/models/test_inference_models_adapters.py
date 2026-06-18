@@ -101,6 +101,7 @@ def _make_pipeline_adapter(
     adapter._model = _FakePipelineModel(futures=futures, ops=ops)
     adapter.class_names = []
     adapter.map_inference_kwargs = lambda kwargs: dict(kwargs)
+    adapter._get_gpu_submit_executor = lambda: _ImmediateExecutor()
     adapter._get_response_executor = lambda: _ImmediateExecutor()
     adapter._build_responses_from_detections = (
         lambda _detections, preprocess_return_metadata, **_kwargs: [
@@ -315,7 +316,7 @@ def test_pipeline_submits_previous_future_before_next_forward() -> None:
     adapter.predict("frame-2", response_mask_format="dense")
 
     assert future_1.submitted_meta == [meta_1]
-    assert ops == ["forward:f1", "submit:f1", "forward:f2"]
+    assert ops == ["forward:f1", "submit:f1", "forward:f2", "result:f1"]
 
 
 def test_pipeline_returns_previous_frame_response_using_previous_metadata() -> None:
@@ -342,13 +343,23 @@ def test_pipeline_returns_previous_frame_response_using_previous_metadata() -> N
 
     assert responses == ["meta-1"]
     assert future_1.submitted_meta == [meta_1]
+    assert future_2.submitted_meta == []
+    assert ops == [
+        "forward:f1",
+        "submit:f1",
+        "forward:f2",
+        "result:f1",
+    ]
+
+    assert adapter.flush() == ["meta-2"]
     assert future_2.submitted_meta == [meta_2]
     assert ops == [
         "forward:f1",
         "submit:f1",
         "forward:f2",
-        "submit:f2",
         "result:f1",
+        "submit:f2",
+        "result:f2",
     ]
 
 
@@ -404,6 +415,17 @@ def test_pipeline_depth_three_submits_oldest_pending_before_forward() -> None:
     assert responses == ["meta-1"]
     assert future_1.submitted_meta == [meta_1]
     assert future_2.submitted_meta == [meta_2]
+    assert future_3.submitted_meta == []
+    assert ops == [
+        "forward:f1",
+        "submit:f1",
+        "forward:f2",
+        "submit:f2",
+        "forward:f3",
+        "result:f1",
+    ]
+
+    assert adapter.flush() == ["meta-2", "meta-3"]
     assert future_3.submitted_meta == [meta_3]
     assert ops == [
         "forward:f1",
@@ -411,6 +433,8 @@ def test_pipeline_depth_three_submits_oldest_pending_before_forward() -> None:
         "forward:f2",
         "submit:f2",
         "forward:f3",
-        "submit:f3",
         "result:f1",
+        "submit:f3",
+        "result:f2",
+        "result:f3",
     ]

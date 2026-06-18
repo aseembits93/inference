@@ -123,7 +123,7 @@ class PipelinedWorkflowRunner:
         predictions = self._workflow_runner._run_workflow(
             video_frames=video_frames,
             defer_stream_pipeline_flush=True,
-            resolve_output_futures=self._workflow_runner._serialize_results,
+            resolve_output_futures=False,
         )
         stream_buffer_depth = self._stream_buffer_depth()
         if stream_buffer_depth <= 0:

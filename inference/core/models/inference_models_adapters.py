@@ -33,7 +33,6 @@ from inference.core.entities.responses.inference import (
     ObjectDetectionInferenceResponse,
     ObjectDetectionPrediction,
     Point,
-    PointDC,
     SemanticSegmentationInferenceResponse,
     SemanticSegmentationPrediction,
 )
@@ -359,6 +358,7 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         self._response_futures: Deque[
             Future[List[InstanceSegmentationInferenceResponse]]
         ] = deque()
+        self._gpu_submit_executor: Optional[ThreadPoolExecutor] = None
 
     def _resolve_pipeline_depth(self) -> int:
         requested_depth = get_rfdetr_pipeline_depth()
@@ -436,16 +436,14 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         )
         mapped_kwargs["defer_postprocess_sync"] = True
         mapped_kwargs["reuse_trt_graph_outputs"] = True
-        # Pipelined path: before launching frame N's forward, enqueue the
-        # oldest frame whose postprocess metadata is already known. That keeps
-        # postprocess off the current frame's postprocess() host path while
-        # still preserving the correctness dependency for reused TRT outputs.
+        # Pipelined path: before launching frame N's forward, enqueue GPU
+        # postprocess for the oldest frame whose metadata is already known.
+        # Deferring the current frame's postprocess until the next predict()
+        # call keeps result decoding out of the immediate postprocess path.
         self._submit_next_pending_gpu_work()
         pre_processing_meta = getattr(img_in, "_pre_processing_meta", None)
         fut = self._model.forward_async(img_in, pre_processing_meta, **mapped_kwargs)
         attach_adapter_mapped_kwargs(fut, mapped_kwargs)
-        if pre_processing_meta is not None:
-            self._submit_future_gpu_work(fut, pre_processing_meta, mapped_kwargs)
         self._submit_ready_responses()
         return fut
 
@@ -467,15 +465,24 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         return responses
 
     def shutdown_pipeline(self) -> None:
-        if self._response_executor is None:
-            return None
-        self._response_executor.shutdown(wait=False)
-        self._response_executor = None
+        gpu_submit_executor = getattr(self, "_gpu_submit_executor", None)
+        if gpu_submit_executor is not None:
+            gpu_submit_executor.shutdown(wait=False)
+            self._gpu_submit_executor = None
+        response_executor = getattr(self, "_response_executor", None)
+        if response_executor is not None:
+            response_executor.shutdown(wait=False)
+            self._response_executor = None
 
     def _get_response_executor(self) -> ThreadPoolExecutor:
-        if self._response_executor is None:
+        if getattr(self, "_response_executor", None) is None:
             self._response_executor = ThreadPoolExecutor(max_workers=1)
         return self._response_executor
+
+    def _get_gpu_submit_executor(self) -> ThreadPoolExecutor:
+        if getattr(self, "_gpu_submit_executor", None) is None:
+            self._gpu_submit_executor = ThreadPoolExecutor(max_workers=1)
+        return self._gpu_submit_executor
 
     def _submit_future_gpu_work(
         self,
@@ -489,9 +496,32 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         fut._kwargs = mapped_kwargs  # type: ignore[attr-defined]
         submit_gpu_work = getattr(fut, "submit_gpu_work", None)
         if callable(submit_gpu_work):
-            submit_gpu_work(meta)
             self._gpu_submit_generation = getattr(self, "_gpu_submit_generation", 0) + 1
+            submit_future = self._get_gpu_submit_executor().submit(
+                self._run_future_gpu_work,
+                fut,
+                meta,
+                mapped_kwargs,
+            )
+            fut._adapter_gpu_submit_future = submit_future  # type: ignore[attr-defined]
             mark_adapter_gpu_work_submitted(fut, self._gpu_submit_generation)
+
+    def _run_future_gpu_work(
+        self,
+        fut: InferenceFuture,
+        meta: PreprocessingMetadata,
+        mapped_kwargs: dict,
+    ) -> None:
+        fut._meta = meta  # type: ignore[attr-defined]
+        fut._kwargs = mapped_kwargs  # type: ignore[attr-defined]
+        submit_gpu_work = getattr(fut, "submit_gpu_work", None)
+        if callable(submit_gpu_work):
+            submit_gpu_work(meta)
+
+    def _wait_for_future_gpu_work_submission(self, fut: InferenceFuture) -> None:
+        submit_future = getattr(fut, "_adapter_gpu_submit_future", None)
+        if submit_future is not None:
+            submit_future.result()
 
     def _submit_next_pending_gpu_work(self) -> None:
         if not self._pending_gpu_submissions:
@@ -528,7 +558,8 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
             if submit_generation is None:
                 break
             gpu_submit_generation = getattr(self, "_gpu_submit_generation", 0)
-            if gpu_submit_generation < submit_generation + self._response_delay:
+            response_build_delay = max(0, self._response_delay - 1)
+            if gpu_submit_generation < submit_generation + response_build_delay:
                 break
             self._submit_response_build(*self._pending_futures.popleft())
 
@@ -557,7 +588,6 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         )
         self._pending_futures.append((fut, preprocess_return_metadata, mapped_kwargs))
         if len(self._pending_futures) > self._response_delay:
-            self._submit_next_pending_gpu_work()
             self._submit_ready_responses()
 
         if not self._response_futures:
@@ -616,6 +646,7 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         # because _DirectInferenceFuture's post_process is memoised.
         fut._meta = preprocess_return_metadata  # type: ignore[attr-defined]
         fut._kwargs = mapped_kwargs  # type: ignore[attr-defined]
+        self._wait_for_future_gpu_work_submission(fut)
         detections_list = fut.result()
         return self._build_responses_from_detections(
             detections_list, preprocess_return_metadata, **mapped_kwargs
@@ -841,10 +872,7 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                             confidence=float(conf),
                             class_name=class_name,
                             class_id=class_id_int,
-                            points=[
-                                PointDC(x=float(point[0]), y=float(point[1]))
-                                for point in mask_as_poly_or_rle
-                            ],
+                            points=mask_as_poly_or_rle,
                         )
                     )
                 else:

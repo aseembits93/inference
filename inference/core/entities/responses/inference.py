@@ -302,7 +302,7 @@ class InstanceSegmentationPredictionDC:
     confidence: float
     class_name: str  # serialized as "class" in the dict form
     class_id: int
-    points: list  # list[PointDC]
+    points: object  # numpy Nx2 array or list[PointDC]
     detection_id: str = field(default_factory=lambda: str(uuid4()))
     parent_id: object = None
     class_confidence: object = None
@@ -336,13 +336,26 @@ def _is_pred_dc_to_dict(p: InstanceSegmentationPredictionDC) -> dict:
         "class": p.class_name,  # alias
         "class_id": p.class_id,
         "detection_id": p.detection_id,
-        "points": [{"x": pt.x, "y": pt.y} for pt in p.points],
+        "points": _points_to_dicts(p.points),
     }
     if p.class_confidence is not None:
         d["class_confidence"] = p.class_confidence
     if p.parent_id is not None:
         d["parent_id"] = p.parent_id
     return d
+
+
+def _points_to_dicts(points: object) -> list:
+    if hasattr(points, "shape"):
+        return [{"x": float(point[0]), "y": float(point[1])} for point in points]
+    return [
+        (
+            {"x": point.x, "y": point.y}
+            if hasattr(point, "x")
+            else {"x": float(point[0]), "y": float(point[1])}
+        )
+        for point in points
+    ]
 
 
 def _is_response_dc_to_dict(r: InstanceSegmentationInferenceResponseDC) -> dict:
