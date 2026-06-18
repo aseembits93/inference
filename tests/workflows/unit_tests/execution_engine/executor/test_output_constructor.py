@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from typing import Any, List, Optional
 from unittest.mock import MagicMock
 
@@ -573,6 +574,51 @@ def test_construct_workflow_output_when_batch_outputs_present() -> None:
         "b_empty": None,
         "b_empty_nested": [[]],
     }
+
+
+def test_construct_workflow_output_resolves_futures_in_batch_outputs() -> None:
+    # given
+    execution_data_manager = MagicMock()
+    workflow_outputs = [
+        JsonField(type="JsonField", name="a", selector="$steps.some.a"),
+    ]
+    execution_graph = DiGraph()
+    execution_graph.add_node(
+        "$outputs.a",
+        node_compilation_output=OutputNode(
+            node_category=NodeCategory.OUTPUT_NODE,
+            name=workflow_outputs[0].name,
+            selector=workflow_outputs[0].selector,
+            data_lineage=["<workflow_input>"],
+            output_manifest=workflow_outputs[0],
+        ),
+    )
+    execution_graph.graph[TOP_LEVEL_LINEAGES_KEY] = WORKFLOW_INPUT_BATCH_LINEAGE_ID
+    execution_data_manager.get_selector_indices.return_value = [(0,), (1,)]
+    execution_data_manager.get_lineage_indices.return_value = [(0,), (1,)]
+    first_future = Future()
+    first_future.set_result("resolved-0")
+    second_future = Future()
+    second_future.set_result("resolved-1")
+    execution_data_manager.get_batch_data.return_value = [
+        first_future,
+        {"nested": second_future},
+    ]
+
+    # when
+    result = construct_workflow_output(
+        workflow_outputs=workflow_outputs,
+        execution_graph=execution_graph,
+        execution_data_manager=execution_data_manager,
+        serialize_results=False,
+        kinds_serializers=KINDS_SERIALIZERS,
+    )
+
+    # then
+    assert result == [
+        {"a": "resolved-0"},
+        {"a": {"nested": "resolved-1"}},
+    ]
 
 
 def test_serialize_data_piece_for_wildcard_output_when_serializer_not_found() -> None:

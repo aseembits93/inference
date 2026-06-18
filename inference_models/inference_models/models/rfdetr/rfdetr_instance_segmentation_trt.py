@@ -354,13 +354,16 @@ class RFDetrForInstanceSegmentationTRT(
                     synchronize=False,
                 )
         graph_state = getattr(raw[0], "_trt_graph_state", None)
-        if graph_state is None:
-            # Dynamic TensorRT execution does not expose graph-owned output
-            # buffers, so the future must wait for inference completion before
-            # handing outputs to postprocess.
-            self._inference_stream.synchronize()
-            return _DirectInferenceFuture(self, raw, pre_processing_meta, None, kwargs)
         produce_event = getattr(raw[0], "_trt_produce_event", None)
+        if graph_state is None:
+            # Split batched graph execution concatenates cloned chunk outputs.
+            # Those tensors are not graph-owned, but they still carry a produce
+            # event so postprocess can wait without blocking the host.
+            if produce_event is None:
+                self._inference_stream.synchronize()
+            return _DirectInferenceFuture(
+                self, raw, pre_processing_meta, produce_event, kwargs
+            )
         if kwargs.get("reuse_trt_graph_outputs", False):
             # The stream pipeline schedules postprocess before launching the
             # next graph replay. That ordering lets postprocess read TensorRT's
