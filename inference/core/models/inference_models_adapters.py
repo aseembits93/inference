@@ -17,8 +17,11 @@ from inference.core.entities.responses.inference import (
     ClassificationInferenceResponse,
     InferenceResponse,
     InferenceResponseImage,
+    InferenceResponseImageDC,
     InstanceSegmentationInferenceResponse,
+    InstanceSegmentationInferenceResponseDC,
     InstanceSegmentationPrediction,
+    InstanceSegmentationPredictionDC,
     InstanceSegmentationRLEPrediction,
     Keypoint,
     KeypointsDetectionInferenceResponse,
@@ -27,6 +30,7 @@ from inference.core.entities.responses.inference import (
     ObjectDetectionInferenceResponse,
     ObjectDetectionPrediction,
     Point,
+    PointDC,
     SemanticSegmentationInferenceResponse,
     SemanticSegmentationPrediction,
 )
@@ -325,6 +329,15 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
         detections_list = self._model.post_process(
             predictions, preprocess_return_metadata, **mapped_kwargs
         )
+        # Workflow callers consume a plain dict via `_is_response_dc_to_dict`;
+        # dataclasses avoid pydantic validation + `model_dump` overhead per
+        # frame. Every other caller (HTTP, cache, visualization) keeps the
+        # pydantic path because it depends on the pydantic class identity.
+        # RLE responses stay on the pydantic path for safety.
+        use_dc = (
+            not return_in_rle
+            and kwargs.get("source") == "workflow-execution"
+        )
 
         responses: List[InstanceSegmentationInferenceResponse] = []
         for preproc_metadata, det in zip(preprocess_return_metadata, detections_list):
@@ -370,7 +383,23 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                     and class_name not in kwargs["class_filter"]
                 ):
                     continue
-                if not return_in_rle:
+                if use_dc:
+                    predictions.append(
+                        InstanceSegmentationPredictionDC(
+                            x=cx,
+                            y=cy,
+                            width=w,
+                            height=h,
+                            confidence=float(conf),
+                            class_name=class_name,
+                            class_id=class_id_int,
+                            points=[
+                                PointDC(x=float(point[0]), y=float(point[1]))
+                                for point in mask_as_poly_or_rle
+                            ],
+                        )
+                    )
+                elif not return_in_rle:
                     predictions.append(
                         InstanceSegmentationPrediction(
                             x=cx,
@@ -404,12 +433,20 @@ class InferenceModelsInstanceSegmentationAdapter(Model):
                         )
                     )
 
-            responses.append(
-                InstanceSegmentationInferenceResponse(
-                    predictions=predictions,
-                    image=InferenceResponseImage(width=W, height=H),
+            if use_dc:
+                responses.append(
+                    InstanceSegmentationInferenceResponseDC(
+                        predictions=predictions,
+                        image=InferenceResponseImageDC(width=W, height=H),
+                    )
                 )
-            )
+            else:
+                responses.append(
+                    InstanceSegmentationInferenceResponse(
+                        predictions=predictions,
+                        image=InferenceResponseImage(width=W, height=H),
+                    )
+                )
         return responses
 
     def clear_cache(self, delete_from_disk: bool = True) -> None:
