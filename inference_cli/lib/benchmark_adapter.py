@@ -46,7 +46,7 @@ def run_infer_api_speed_benchmark(
         api_key=api_key,
         model_configuration=model_configuration,
         disable_active_learning=True,
-        max_concurrent_requests=1,
+        max_concurrent_requests=number_of_clients,
         max_batch_size=request_batch_size,
     )
     client.select_model(model_id=model_id)
@@ -119,7 +119,7 @@ def run_workflow_api_speed_benchmark(
         api_key=api_key,
         model_configuration=model_configuration,
         disable_active_learning=True,
-        max_concurrent_requests=1,
+        max_concurrent_requests=number_of_clients,
         max_batch_size=request_batch_size,
     )
     benchmark_results = coordinate_workflow_api_speed_benchmark(
