@@ -1,0 +1,5 @@
+*.onnx
+*.engine
+*.plan
+*.pyc
+__pycache__/
