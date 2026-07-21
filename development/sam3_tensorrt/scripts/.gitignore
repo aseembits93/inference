@@ -1,0 +1,6 @@
+sam3_onnx_exports/
+sam3_hf_onnx/
+*.onnx
+*.engine
+*.plan
+__pycache__/
