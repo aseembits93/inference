@@ -188,13 +188,18 @@ def detections_are_close_to_threshold(
     epsilon: float,
     minimum_objects_close_to_threshold: int,
 ) -> bool:
-    detections_close_to_threshold = count_detections_close_to_threshold(
-        prediction=prediction,
-        selected_class_names=selected_class_names,
-        threshold=threshold,
-        epsilon=epsilon,
-    )
-    return detections_close_to_threshold >= minimum_objects_close_to_threshold
+    # Inline count_detections_close_to_threshold for better performance
+    counter = 0
+    for prediction_details in prediction["predictions"]:
+        class_name = prediction_details["class"]
+        if selected_class_names is not None and class_name not in selected_class_names:
+            continue
+        if abs(prediction_details["confidence"] - threshold) < epsilon:
+            counter += 1
+            # Early exit if we've already met the threshold
+            if counter >= minimum_objects_close_to_threshold:
+                return True
+    return counter >= minimum_objects_close_to_threshold
 
 
 def count_detections_close_to_threshold(
