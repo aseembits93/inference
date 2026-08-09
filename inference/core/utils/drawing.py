@@ -72,7 +72,7 @@ def _aggregate_images_shape(
 def _establish_grid_size(
     images: List[np.ndarray], grid_size: Optional[Tuple[Optional[int], Optional[int]]]
 ) -> Tuple[int, int]:
-    if grid_size is None or all(e is None for e in grid_size):
+    if grid_size is None or grid_size == (None, None):
         return _negotiate_grid_size(images=images)
     if grid_size[0] is None:
         return math.ceil(len(images) / grid_size[1]), grid_size[1]
@@ -82,12 +82,13 @@ def _establish_grid_size(
 
 
 def _negotiate_grid_size(images: List[np.ndarray]) -> Tuple[int, int]:
-    if len(images) <= MAX_COLUMNS_FOR_SINGLE_ROW_GRID:
-        return 1, len(images)
-    nearest_sqrt = math.ceil(np.sqrt(len(images)))
+    num_images = len(images)
+    if num_images <= MAX_COLUMNS_FOR_SINGLE_ROW_GRID:
+        return 1, num_images
+    nearest_sqrt = math.ceil(math.sqrt(num_images))
     proposed_columns = nearest_sqrt
     proposed_rows = nearest_sqrt
-    while proposed_columns * (proposed_rows - 1) >= len(images):
+    while proposed_columns * (proposed_rows - 1) >= num_images:
         proposed_rows -= 1
     return proposed_rows, proposed_columns
 
