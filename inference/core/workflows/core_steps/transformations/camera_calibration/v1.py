@@ -272,14 +272,31 @@ def remove_distortions(
         alpha=1,
         newImgSize=(w, h),
     )
-    # https://docs.opencv.org/4.11.0/d9/d0c/group__calib3d.html#ga69f2545a8b62a6b0fc2ee060dc30559d
-    dst = cv.undistort(
-        src=img,
-        cameraMatrix=cameraMatrix,
-        distCoeffs=distCoeffs,
-        dst=None,
-        newCameraMatrix=newcameramtx,
-    )
+
+    # Pre-compute undistortion maps for faster remapping
+    # Only use optimized path if image has valid dimensions
+    if h > 0 and w > 0:
+        map1, map2 = cv.initUndistortRectifyMap(
+            cameraMatrix=cameraMatrix,
+            distCoeffs=distCoeffs,
+            R=None,
+            newCameraMatrix=newcameramtx,
+            size=(w, h),
+            m1type=cv.CV_32FC1,
+        )
+
+        # Apply the undistortion using pre-computed maps
+        dst = cv.remap(src=img, map1=map1, map2=map2, interpolation=cv.INTER_LINEAR)
+    else:
+        # Fall back to original method for edge cases (e.g., zero-sized images)
+        # to maintain original error behavior
+        dst = cv.undistort(
+            src=img,
+            cameraMatrix=cameraMatrix,
+            distCoeffs=distCoeffs,
+            dst=None,
+            newCameraMatrix=newcameramtx,
+        )
     return WorkflowImageData(
         parent_metadata=image.parent_metadata,
         numpy_image=dst,
