@@ -7,6 +7,9 @@ from roboflow_workflows.errors import AssumptionError, ExecutionEngineRuntimeErr
 from roboflow_workflows.execution_engine.constants import (
     NODE_COMPILATION_OUTPUT_PROPERTY,
 )
+from roboflow_workflows.execution_engine.entities.stream_pipeline import (
+    StreamPipelineBatchResult,
+)
 from roboflow_workflows.execution_engine.v1.compiler.entities import (
     CompoundStepInputDefinition,
     DynamicStepInputDefinition,
@@ -80,6 +83,8 @@ class ExecutionDataManager:
         self._execution_cache = execution_cache
         self._dynamic_batches_manager = dynamic_batches_manager
         self._branching_manager = branching_manager
+        self._stream_pipeline_outputs: Dict[str, StreamPipelineBatchResult] = {}
+        self._defer_stream_pipeline_outputs = False
 
     def all_inputs_impacting_step_are_registered(self, step_selector: str) -> bool:
         step_node_data: StepNode = self._execution_graph.nodes[step_selector][
@@ -246,6 +251,16 @@ class ExecutionDataManager:
         indices: List[DynamicBatchIndex],
         outputs: BlockResult,
     ) -> None:
+        """Register a batch's outputs and its optional stream response identity.
+
+        Args:
+            step_selector: Selector of the producing step.
+            indices: Dynamic batch indices of this invocation.
+            outputs: Block results, including flow-control or delayed results.
+        """
+        if isinstance(outputs, StreamPipelineBatchResult):
+            self._stream_pipeline_outputs[step_selector] = outputs
+
         if not self.is_step_simd(step_selector=step_selector):
             raise ExecutionEngineRuntimeError(
                 public_message=f"Error in execution engine. In context of non-SIMD step: {step_selector} attempts to "

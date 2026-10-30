@@ -28,6 +28,7 @@ from roboflow_workflows.execution_engine.v1.compiler.utils import (
     is_input_selector,
 )
 from roboflow_workflows.execution_engine.v1.executor.core import (
+    close_stream_pipelines,
     close_workflow_blocks,
     flush_stream_pipeline_workflow,
     run_workflow,
@@ -37,6 +38,9 @@ from roboflow_workflows.execution_engine.v1.executor.runtime_input_assembler imp
 )
 from roboflow_workflows.execution_engine.v1.executor.runtime_input_validator import (
     validate_runtime_input,
+)
+from roboflow_workflows.execution_engine.v1.executor.stream_pipeline import (
+    _StreamPipelineExecutionState,
 )
 from roboflow_workflows.execution_engine.v1.step_error_handlers import (
     legacy_step_error_handler,
@@ -598,6 +602,7 @@ class ExecutionEngineV1(BaseExecutionEngine):
         self._pre_init_api_key = pre_init_api_key
         self._pre_init_step_execution_mode = pre_init_step_execution_mode
         self._pending_dependencies_resolution_attempted = False
+        self._stream_pipeline_state = None
         self._execution_observer = (
             execution_observer
             if execution_observer is not None
@@ -613,7 +618,34 @@ class ExecutionEngineV1(BaseExecutionEngine):
         defer_stream_pipeline_flush: bool = False,
         resolve_output_futures: bool = True,
     ) -> List[Dict[str, Any]]:
+        """Execute the workflow for a request or the next streaming frame.
+
+        Args:
+            runtime_parameters: Raw workflow input values.
+            fps: Host-reported stream processing rate.
+            _is_preview: Whether this is a preview invocation.
+            serialize_results: Whether to serialize output values.
+            defer_stream_pipeline_flush: Retain in-flight frames across calls.
+            resolve_output_futures: Whether to await returned output futures.
+
+        Returns:
+            Completed frame outputs, or an empty list during stream warmup.
+
+        Raises:
+            RuntimeError: A regular request would overwrite pending stream state.
+        """
         self._profiler.start_workflow_run()
+        if (
+            not defer_stream_pipeline_flush
+            and self._stream_pipeline_state is not None
+            and self._stream_pipeline_state.pending
+        ):
+            raise RuntimeError("Flush pending stream frames before a non-streaming run")
+
+        if defer_stream_pipeline_flush and self._stream_pipeline_state is None:
+            self._stream_pipeline_state = _StreamPipelineExecutionState._init(
+                self._compiled_workflow
+            )
         runtime_parameters = assemble_runtime_parameters(
             runtime_parameters=runtime_parameters,
             defined_inputs=self._compiled_workflow.workflow_definition.inputs,
@@ -664,14 +696,32 @@ class ExecutionEngineV1(BaseExecutionEngine):
                 defer_stream_pipeline_flush=defer_stream_pipeline_flush,
                 resolve_output_futures=resolve_output_futures,
                 observer=self._execution_observer,
+                stream_pipeline_state=(
+                    self._stream_pipeline_state if defer_stream_pipeline_flush else None
+                ),
             ),
         )
         self._profiler.end_workflow_run()
         return result
 
     def close(self) -> None:
-        """Call ``close()`` on every block of the compiled workflow that defines one."""
-        close_workflow_blocks(workflow=self._compiled_workflow)
+        """Drain stream workers, discard retained frames and close workflow blocks."""
+        if self._stream_pipeline_state is not None:
+            self._stream_pipeline_state._clear()
+        try:
+            if self._stream_pipeline_state is not None:
+                close_stream_pipelines(workflow=self._compiled_workflow)
+        finally:
+            close_workflow_blocks(workflow=self._compiled_workflow)
+
+    def stream_pipeline_depth(self) -> int:
+        """Return the stream's output delay, including synchronous fallback frames.
+
+        Returns:
+            Number of workflow runs retained for alignment with delayed results.
+        """
+        depth = self._stream_pipeline_state.depth if self._stream_pipeline_state else 0
+        return depth
 
     def flush_stream_pipeline(
         self,
@@ -680,6 +730,17 @@ class ExecutionEngineV1(BaseExecutionEngine):
         _is_preview: bool = False,
         serialize_results: bool = False,
     ) -> List[Dict[str, Any]]:
+        """Finish the next pending streaming frame and its downstream steps.
+
+        Args:
+            runtime_parameters: Host inputs, used by legacy streams without state.
+            fps: Host-reported stream processing rate.
+            _is_preview: Whether this is a preview invocation.
+            serialize_results: Whether to serialize output values.
+
+        Returns:
+            Final frame outputs, or an empty list after the stream is drained.
+        """
         self._profiler.start_workflow_run()
         runtime_parameters = assemble_runtime_parameters(
             runtime_parameters=runtime_parameters,
@@ -703,6 +764,7 @@ class ExecutionEngineV1(BaseExecutionEngine):
             executor=self._executor,
             step_error_handler=self._step_error_handler,
             observer=self._execution_observer,
+            stream_pipeline_state=self._stream_pipeline_state,
         )
         self._profiler.end_workflow_run()
         return result

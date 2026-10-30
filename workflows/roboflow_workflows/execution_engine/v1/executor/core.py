@@ -24,6 +24,9 @@ except ImportError:
 
 from roboflow_workflows.environment import INFERENCE_DEBUG_OUTPUT_DIR
 from roboflow_workflows.errors import BlockTraceback, StepExecutionError, WorkflowError
+from roboflow_workflows.execution_engine.entities.stream_pipeline import (
+    StreamPipelineBatchResult,
+)
 from roboflow_workflows.execution_engine.profiling.core import (
     NullWorkflowsProfiler,
     WorkflowsProfiler,
@@ -49,6 +52,9 @@ from roboflow_workflows.execution_engine.v1.executor.flow_coordinator import (
 )
 from roboflow_workflows.execution_engine.v1.executor.output_constructor import (
     construct_workflow_output,
+)
+from roboflow_workflows.execution_engine.v1.executor.stream_pipeline import (
+    _StreamPipelineExecutionState,
 )
 from roboflow_workflows.execution_engine.v1.executor.utils import run_steps_in_parallel
 from roboflow_workflows.prototypes.block import WorkflowBlock
@@ -101,7 +107,27 @@ def run_workflow(
     defer_stream_pipeline_flush: bool = False,
     resolve_output_futures: bool = True,
     observer: ExecutionObserver = NULL_EXECUTION_OBSERVER,
+    stream_pipeline_state: Optional[_StreamPipelineExecutionState] = None,
 ) -> List[Dict[str, Any]]:
+    """Execute a compiled workflow, optionally resuming delayed frame state.
+
+    Args:
+        workflow: Compiled steps and their dependency graph.
+        runtime_parameters: Assembled inputs for the submitted frame.
+        max_concurrent_steps: Maximum number of concurrent block invocations.
+        kinds_serializers: Output serializers indexed by kind.
+        serialize_results: Whether to serialize workflow outputs.
+        profiler: Profiler for this invocation.
+        executor: Optional caller-owned worker pool.
+        step_error_handler: Callback for block execution errors.
+        defer_stream_pipeline_flush: Keep model work pending between stream frames.
+        resolve_output_futures: Whether to resolve futures in constructed outputs.
+        observer: Host hooks for step execution.
+        stream_pipeline_state: This stream's retained frame contexts.
+
+    Returns:
+        Outputs for the completed frame, or an empty list during stream warmup.
+    """
     return _run_workflow(
         workflow=workflow,
         runtime_parameters=runtime_parameters,
@@ -114,6 +140,7 @@ def run_workflow(
         defer_stream_pipeline_flush=defer_stream_pipeline_flush,
         resolve_output_futures=resolve_output_futures,
         observer=observer,
+        stream_pipeline_state=stream_pipeline_state,
     )
 
 
@@ -129,6 +156,7 @@ def _run_workflow(
     defer_stream_pipeline_flush: bool = False,
     resolve_output_futures: bool = True,
     observer: ExecutionObserver = NULL_EXECUTION_OBSERVER,
+    stream_pipeline_state: Optional[_StreamPipelineExecutionState] = None,
 ) -> List[Dict[str, Any]]:
     execution_data_manager = ExecutionDataManager.init(
         execution_graph=workflow.execution_graph,
@@ -137,6 +165,10 @@ def _run_workflow(
     execution_coordinator = ParallelStepExecutionCoordinator.init(
         execution_graph=workflow.execution_graph,
     )
+    execution_data_manager._defer_stream_pipeline_outputs = (
+        stream_pipeline_state is not None
+    )
+    downstream_waves = []
     workflow_execution_id = get_or_create_workflow_execution_id()
     # Hosts that supply no executor (standalone `roboflow-workflows`, SDK and
     # embedded usage) previously paid a fresh ThreadPoolExecutor per DAG wave:
@@ -165,9 +197,29 @@ def _run_workflow(
     # once on every supported path; both are pinned in the ownership tests.
     owned_executor: Optional[ThreadPoolExecutor] = None
     run_executor = executor
+    failed = False
     try:
         next_steps = execution_coordinator.get_steps_to_execute_next(profiler=profiler)
         while next_steps is not None:
+            if stream_pipeline_state is not None:
+                downstream_waves.append(
+                    [
+                        step
+                        for step in next_steps
+                        if step in stream_pipeline_state.downstream
+                    ]
+                )
+                next_steps = [
+                    step
+                    for step in next_steps
+                    if step not in stream_pipeline_state.downstream
+                ]
+            if not next_steps:
+                next_steps = execution_coordinator.get_steps_to_execute_next(
+                    profiler=profiler
+                )
+                continue
+
             if run_executor is None:
                 owned_executor = ThreadPoolExecutor(max_workers=max_concurrent_steps)
                 run_executor = owned_executor
@@ -189,6 +241,28 @@ def _run_workflow(
             next_steps = execution_coordinator.get_steps_to_execute_next(
                 profiler=profiler
             )
+        if stream_pipeline_state is not None:
+            execution_data_manager = stream_pipeline_state._finish_submission(
+                execution_data_manager
+            )
+            if execution_data_manager is None:
+                return []
+
+            for next_steps in downstream_waves:
+                if not next_steps:
+                    continue
+                execute_steps(
+                    next_steps=next_steps,
+                    workflow=workflow,
+                    execution_data_manager=execution_data_manager,
+                    max_concurrent_steps=max_concurrent_steps,
+                    workflow_execution_id=workflow_execution_id,
+                    profiler=profiler,
+                    executor=run_executor,
+                    step_error_handler=step_error_handler,
+                    observer=observer,
+                    flat_dispatch=executor is None,
+                )
         if not defer_stream_pipeline_flush:
             with profiler.profile_execution_phase(
                 name="stream_pipeline_flush",
@@ -210,6 +284,11 @@ def _run_workflow(
                 kinds_serializers=kinds_serializers,
                 resolve_output_futures=resolve_output_futures,
             )
+    except BaseException:
+        failed = True
+        if stream_pipeline_state is not None:
+            stream_pipeline_state._clear()
+        raise
     finally:
         try:
             if owned_executor is not None:
@@ -222,7 +301,7 @@ def _run_workflow(
             # (e.g. KeyboardInterrupt during join): the historical per-wave
             # `with` lived inside `execute_steps`, so the outer cleanup
             # always ran.
-            if not defer_stream_pipeline_flush:
+            if failed or not defer_stream_pipeline_flush:
                 close_stream_pipelines(workflow=workflow)
 
 
@@ -236,17 +315,46 @@ def flush_stream_pipeline_workflow(
     executor: Optional[ThreadPoolExecutor] = None,
     step_error_handler: Optional[Callable[[Exception], None]] = None,
     observer: ExecutionObserver = NULL_EXECUTION_OBSERVER,
+    stream_pipeline_state: Optional[_StreamPipelineExecutionState] = None,
 ) -> List[Dict[str, Any]]:
-    execution_data_manager = ExecutionDataManager.init(
-        execution_graph=workflow.execution_graph,
-        runtime_parameters=runtime_parameters,
-    )
+    """Complete a pending frame using its saved upstream execution state.
+
+    Args:
+        workflow: Compiled steps and their dependency graph.
+        runtime_parameters: Inputs used only when no retained stream state exists.
+        max_concurrent_steps: Maximum number of concurrent block invocations.
+        kinds_serializers: Output serializers indexed by kind.
+        serialize_results: Whether to serialize workflow outputs.
+        profiler: Profiler for this invocation.
+        executor: Optional caller-owned worker pool.
+        step_error_handler: Callback for block execution errors.
+        observer: Host hooks for step execution.
+        stream_pipeline_state: This stream's retained frame contexts.
+
+    Returns:
+        Final frame outputs, or an empty list when the stream is drained.
+    """
+    if stream_pipeline_state is not None:
+        try:
+            execution_data_manager = stream_pipeline_state._take_next()
+        except BaseException:
+            stream_pipeline_state._clear()
+            close_stream_pipelines(workflow=workflow)
+            raise
+        if execution_data_manager is None:
+            return []
+        flushed_step_selectors = [stream_pipeline_state.selector]
+    else:
+        execution_data_manager = ExecutionDataManager.init(
+            execution_graph=workflow.execution_graph,
+            runtime_parameters=runtime_parameters,
+        )
+        flushed_step_selectors = flush_stream_pipeline_outputs(
+            workflow=workflow,
+            execution_data_manager=execution_data_manager,
+        )
     execution_coordinator = ParallelStepExecutionCoordinator.init(
         execution_graph=workflow.execution_graph,
-    )
-    flushed_step_selectors = flush_stream_pipeline_outputs(
-        workflow=workflow,
-        execution_data_manager=execution_data_manager,
     )
     downstream_step_selectors = _downstream_step_selectors(
         workflow=workflow,
@@ -256,6 +364,7 @@ def flush_stream_pipeline_workflow(
     # Run-scoped pool for executor=None hosts - mirrors `_run_workflow`.
     owned_executor: Optional[ThreadPoolExecutor] = None
     run_executor = executor
+    failed = False
     try:
         next_steps = execution_coordinator.get_steps_to_execute_next(profiler=profiler)
         while next_steps is not None:
@@ -295,9 +404,18 @@ def flush_stream_pipeline_workflow(
             serialize_results=serialize_results,
             kinds_serializers=kinds_serializers,
         )
+    except BaseException:
+        failed = True
+        if stream_pipeline_state is not None:
+            stream_pipeline_state._clear()
+        raise
     finally:
-        if owned_executor is not None:
-            owned_executor.shutdown(wait=True)
+        try:
+            if owned_executor is not None:
+                owned_executor.shutdown(wait=True)
+        finally:
+            if failed:
+                close_stream_pipelines(workflow=workflow)
 
 
 def flush_stream_pipeline_outputs(
@@ -591,6 +709,14 @@ def run_simd_step_in_batch_mode(
     execution_data_manager: ExecutionDataManager,
     profiler: Optional[WorkflowsProfiler] = None,
 ) -> None:
+    """Execute a batch, completing synchronous requests before their consumers.
+
+    Args:
+        step_selector: Selector of the block being executed.
+        step_instance: Initialized block instance.
+        execution_data_manager: Frame-local inputs, outputs and stream metadata.
+        profiler: Profiler for input assembly and block execution.
+    """
     with profiler.profile_execution_phase(
         name="step_input_assembly",
         categories=["execution_engine_operation"],
@@ -622,6 +748,27 @@ def run_simd_step_in_batch_mode(
                         exception=exc,
                     )
                 raise exc
+    if (
+        isinstance(outputs, StreamPipelineBatchResult)
+        and not execution_data_manager._defer_stream_pipeline_outputs
+    ):
+        # A regular (non-streaming) engine run must finish its model result
+        # before image-dependent downstream steps consume it.
+        if outputs.response_context_id != outputs.context_id:
+            flushed = step_instance.flush_stream_pipeline_outputs()
+            matches = [
+                result
+                for _, result in flushed
+                if isinstance(result, StreamPipelineBatchResult)
+                and result.response_context_id == outputs.context_id
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "Stream flush did not return the current workflow frame"
+                )
+            outputs = matches[0]
+        outputs = list(outputs)
+
     with profiler.profile_execution_phase(
         name="step_output_registration",
         categories=["execution_engine_operation"],

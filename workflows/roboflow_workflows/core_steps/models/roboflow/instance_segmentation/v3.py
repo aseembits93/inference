@@ -28,6 +28,9 @@ from roboflow_workflows.execution_engine.entities.base import (
     OutputDefinition,
     WorkflowImageData,
 )
+from roboflow_workflows.execution_engine.entities.stream_pipeline import (
+    StreamPipelineBatchResult,
+)
 from roboflow_workflows.execution_engine.entities.types import (
     BOOLEAN_KIND,
     FLOAT_ZERO_TO_ONE_KIND,
@@ -369,6 +372,27 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
         active_learning_target_dataset: Optional[str],
         enforce_dense_masks_in_inference_models: bool,
     ) -> BlockResult:
+        """Run local segmentation and retain identities for delayed responses.
+
+        Args:
+            images: Input images and their workflow metadata.
+            model_id: Model identifier or local model alias.
+            class_agnostic_nms: Whether NMS ignores class labels.
+            class_filter: Optional output class allowlist.
+            confidence: Detection confidence threshold or configured mode.
+            iou_threshold: Intersection-over-union threshold for NMS.
+            max_detections: Maximum returned detections.
+            max_candidates: Maximum candidate detections before NMS.
+            mask_decode_mode: Mask decoding precision mode.
+            tradeoff_factor: Mask decoding performance tradeoff.
+            disable_active_learning: Whether to disable active learning.
+            active_learning_target_dataset: Optional active-learning destination.
+            enforce_dense_masks_in_inference_models: Request dense mask storage.
+
+        Returns:
+            Batch predictions; pipelined batches also carry submitted and returned
+            frame identities for the execution engine.
+        """
         inference_images = [i.to_inference_format(numpy_preferred=True) for i in images]
         self._last_model_id = model_id
         self._model_manager.add_model(
@@ -381,7 +405,9 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
             model_id=model_id,
             context_id=self._build_stream_context_id(images=images),
         )
-        if self.stream_pipeline_depth() > 0 and len(images) == 1:
+        submitted_context_id = stream_context.context_id
+        pipelined = self.stream_pipeline_depth() > 0 and len(images) == 1
+        if pipelined:
             self._pending_stream_prediction_contexts.append(stream_context)
         results = self._model_manager.run_instance_segmentation(
             model_id=model_id,
@@ -416,14 +442,31 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
                 default=stream_context,
                 context_id=response_context_id,
             )
-            return self._submit_async_post_process_result(
+            outputs = self._submit_async_post_process_result(
                 predictions_future=async_response_future,
                 stream_context=stream_context,
             )
-        return self._finalize_prediction_responses(
+            result = StreamPipelineBatchResult(
+                outputs,
+                context_id=submitted_context_id,
+                response_context_id=stream_context.context_id,
+                response_indices=_stream_context_indices(images=stream_context.images),
+            )
+            return result
+
+        outputs = self._finalize_prediction_responses(
             predictions=predictions,
             stream_context=stream_context,
         )
+        if pipelined:
+            outputs = StreamPipelineBatchResult(
+                outputs,
+                context_id=submitted_context_id,
+                response_context_id=None,
+                response_indices=[],
+            )
+
+        return outputs
 
     def _extract_async_response_future(
         self,
@@ -593,6 +636,11 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
     def flush_stream_pipeline_outputs(
         self,
     ) -> List[Tuple[List[Tuple[int, ...]], BlockResult]]:
+        """Drain pending predictions with their originating frame identities.
+
+        Returns:
+            Pairs of batch indices and frame-identified block outputs.
+        """
         if (
             self._last_model_id is None
             or self._last_model_id not in self._model_manager
@@ -622,9 +670,16 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
             results.append(
                 (
                     _stream_context_indices(images=stream_context.images),
-                    self._finalize_prediction_responses(
-                        predictions=prediction_batch,
-                        stream_context=stream_context,
+                    StreamPipelineBatchResult(
+                        self._finalize_prediction_responses(
+                            predictions=prediction_batch,
+                            stream_context=stream_context,
+                        ),
+                        context_id=stream_context.context_id,
+                        response_context_id=stream_context.context_id,
+                        response_indices=_stream_context_indices(
+                            images=stream_context.images
+                        ),
                     ),
                 )
             )
@@ -638,6 +693,8 @@ class RoboflowInstanceSegmentationModelBlockV3(WorkflowBlock):
         return [outputs for _, outputs in self.flush_stream_pipeline_outputs()]
 
     def close_stream_pipeline(self) -> None:
+        """Release pending frame contexts and stop this block's stream workers."""
+        self._pending_stream_prediction_contexts.clear()
         if self._stream_response_executor is not None:
             finalizer = self._stream_response_executor_finalizer
             if finalizer is not None and finalizer.alive:

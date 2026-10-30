@@ -436,6 +436,8 @@ def post_process_single_instance_segmentation_result_to_rle_masks_triton(
         MAX_TOTAL_RUNS=_SPARSE_MAX_TOTAL_RUNS,
         METADATA_STRIDE=_HEADER_SIZE,
         BLOCK_COLS=_SPARSE_BLOCK_COLS,
+        # Only the explicit FMAs in mask interpolation may fuse operations.
+        enable_fp_fusion=False,
     )
 
     metadata_host = metadata.cpu().numpy()
@@ -586,11 +588,14 @@ def _post_process_ranked_query_masks(
         MAX_TOTAL_RUNS=_SPARSE_MAX_TOTAL_RUNS,
         METADATA_STRIDE=_HEADER_SIZE,
         BLOCK_COLS=_SPARSE_BLOCK_COLS,
+        # Keep the explicit interpolation accumulation order in the retry too.
+        enable_fp_fusion=False,
     )
     if not defer_postprocess_sync:
         result = _instance_detections_from_sparse_query_records(
             class_metadata_host=class_metadata.cpu().numpy(),
             records_host=records.cpu().numpy(),
+            device=image_scores.device,
             max_total_runs=_SPARSE_MAX_TOTAL_RUNS,
             height=output_height,
             width=output_width,
@@ -612,6 +617,7 @@ def _post_process_ranked_query_masks(
     return _deferred_instance_detections_from_sparse_query_records(
         class_metadata_host=class_metadata_host,
         records_host=records_host,
+        device=image_scores.device,
         keepalive_tensors=(query_metadata, class_metadata, source_bounds, records),
         done_event=done_event,
         outputs_consumed_event=outputs_consumed_event,
@@ -664,19 +670,19 @@ def _instance_detections_from_sparse_records(
         )
     if np.any(metadata_host[active_ranks, 8] > 0.5):
         return None
+
+    if _has_tied_scores(metadata_host[active_ranks, 2]):
+        # Global top-k determines the reference's input order for tied scores.
+        # Retry through ranked metadata instead of inventing a secondary key.
+        return None
+
     records_host = records.cpu().numpy()
     total_runs = int(records_host[0, 0])
     if int(records_host[0, 1]) != 0 or total_runs < 0 or total_runs > max_total_runs:
         return None
 
-    # Match RF-DETR's descending score order. ``metadata[:, 10]`` gives a
-    # deterministic secondary order for equal scores without touching masks.
-    order = np.lexsort(
-        (
-            -metadata_host[active_ranks, 10],
-            -metadata_host[active_ranks, 2],
-        )
-    )
+    # Ties use global top-k above; distinct scores need only a host sort.
+    order = np.argsort(-metadata_host[active_ranks, 2])
     active_ranks = active_ranks[order]
     if max_detections is not None:
         active_ranks = active_ranks[:max_detections]
@@ -734,6 +740,12 @@ def _instance_detections_from_sparse_records(
     )
 
 
+def _has_tied_scores(scores: np.ndarray) -> bool:
+    """Detect ties in the small host score vector without a GPU synchronization."""
+    tied = scores.size > 1 and np.unique(scores).size != scores.size
+    return tied
+
+
 def _instance_detections_from_sparse_query_records(
     class_metadata_host: np.ndarray,
     records_host: np.ndarray,
@@ -743,6 +755,7 @@ def _instance_detections_from_sparse_query_records(
     max_detections: Optional[int] = None,
     *,
     image_size: Optional[Tuple[int, int]] = None,
+    device: torch.device = torch.device("cpu"),
 ) -> Optional[InstanceDetections]:
     """Assemble detections when class rows share query-level RLE records.
 
@@ -774,15 +787,14 @@ def _instance_detections_from_sparse_query_records(
     if int(records_host[0, 1]) != 0 or total_runs < 0 or total_runs > max_total_runs:
         return None
 
-    # Sort class candidates by the same score/key order as the eager path. The
-    # RLE records remain keyed by source query and are looked up below.
-    order = np.lexsort(
-        (
-            -class_metadata_host[active_ranks, 10],
-            -class_metadata_host[active_ranks, 2],
-        )
-    )
-    active_ranks = active_ranks[order]
+    # Rows already follow global top-k order, before threshold/class filtering.
+    # The reference then applies an unstable device sort to the surviving scores.
+    # Reproduce that sort only for ties; it may affect max_detections as well.
+    scores = class_metadata_host[active_ranks, 2]
+    if _has_tied_scores(scores):
+        _, order = torch.sort(torch.from_numpy(scores).to(device), descending=True)
+        active_ranks = active_ranks[order.cpu().numpy()]
+
     if max_detections is not None:
         active_ranks = active_ranks[:max_detections]
     if total_runs:
@@ -886,6 +898,7 @@ def _deferred_instance_detections_from_sparse_query_records(
     max_detections: Optional[int],
     *,
     image_size: Optional[Tuple[int, int]] = None,
+    device: torch.device = torch.device("cpu"),
 ) -> InstanceDetections:
     """Return a placeholder detection object with deferred CPU finalization.
 
@@ -912,6 +925,7 @@ def _deferred_instance_detections_from_sparse_query_records(
                 width=width,
                 image_size=image_size,
                 max_detections=max_detections,
+                device=device,
             )
             if result is None:
                 reason = _sparse_query_records_failure_reason(
@@ -963,6 +977,9 @@ def _should_retry_sparse_topk_metadata(
     if active_ranks.size == 0 or np.any(metadata_host[active_ranks, 8] > 0.5):
         return False
 
+    if _has_tied_scores(metadata_host[active_ranks, 2]):
+        return True
+
     records_host = records.cpu().numpy()
     total_runs = int(records_host[0, 0])
     if int(records_host[0, 1]) == 0 or total_runs < 0 or total_runs > max_total_runs:
@@ -1012,6 +1029,8 @@ def _unsupported_triton_postprocess_reason(
         return "tensor_threshold_unsupported"
     if image_scores.ndim != 2 or image_bboxes.ndim != 2 or image_masks.ndim != 3:
         return "invalid_tensor_rank"
+    if image_masks.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return "mask_dtype_unsupported"
     num_queries, num_classes = image_scores.shape
     if image_bboxes.shape != (num_queries, 4) or image_masks.shape[0] != num_queries:
         return "shape_mismatch"
@@ -1171,6 +1190,25 @@ def _attach_uncompressed_counts(
 
 
 if triton is not None:
+
+    @triton.jit
+    def _interpolate_mask_logit(
+        value00, value01, value10, value11, x_weight0, x_weight1, y_weight0, y_weight1
+    ):
+        # torchvision's CUDA antialiased resize accumulates horizontal taps
+        # before vertical taps, using FMA in source-index order. Reassociation
+        # or reversing the axes can flip a near-zero result's sign.
+        top = tl.fma(
+            value01.to(tl.float32), x_weight1, value00.to(tl.float32) * x_weight0
+        )
+        bottom = tl.fma(
+            value11.to(tl.float32), x_weight1, value10.to(tl.float32) * x_weight0
+        )
+        value = tl.fma(bottom, y_weight1, top * y_weight0)
+        # torchvision casts the resized image back to the input dtype before
+        # binarization, including underflow to zero for half-precision masks.
+        value = value.to(value00.dtype)
+        return value
 
     @triton.jit
     def _box_coordinate_on_mask_grid(
@@ -1848,9 +1886,16 @@ if triton is not None:
                     mask=active,
                     other=0.0,
                 )
-                current_values = (
-                    value00 * y_weight0 + value10 * y_weight1
-                ) * x_weight0 + (value01 * y_weight0 + value11 * y_weight1) * x_weight1
+                current_values = _interpolate_mask_logit(
+                    value00,
+                    value01,
+                    value10,
+                    value11,
+                    x_weight0,
+                    x_weight1,
+                    y_weight0,
+                    y_weight1,
+                )
                 current_positive = active & (current_values > 0.0)
 
                 # Starts/ends are transitions along a COCO column-major scan:
@@ -1914,11 +1959,16 @@ if triton is not None:
                     mask=previous_active,
                     other=0.0,
                 )
-                previous_values = (
-                    prev_value00 * prev_y_weight0 + prev_value10 * prev_y_weight1
-                ) * x_weight0 + (
-                    prev_value01 * prev_y_weight0 + prev_value11 * prev_y_weight1
-                ) * x_weight1
+                previous_values = _interpolate_mask_logit(
+                    prev_value00,
+                    prev_value01,
+                    prev_value10,
+                    prev_value11,
+                    x_weight0,
+                    x_weight1,
+                    prev_y_weight0,
+                    prev_y_weight1,
+                )
                 previous_positive = previous_active & (previous_values > 0.0)
                 is_start = current_positive & ~previous_positive
                 is_end = previous_positive & ~current_positive

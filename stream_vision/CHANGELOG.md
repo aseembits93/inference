@@ -4,6 +4,11 @@ This is the canonical changelog for the `streamvision` package.
 
 ## Unreleased
 
+### Fixed
+
+- Use the workflow engine's retained frame delay to keep stream results aligned
+  through skipped model steps and synchronous inference fallbacks.
+
 ## `0.1.4`
 
 ### Changed
