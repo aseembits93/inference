@@ -286,12 +286,20 @@ class PipelinedWorkflowRunner:
         return results
 
     def close(self) -> None:
+        """Release buffered video frames and close the model stream pipelines."""
+        self._pending_video_frames.clear()
         for stream_step in self._stream_steps:
             close_fn = getattr(stream_step.step, "close_stream_pipeline", None)
             if callable(close_fn):
                 close_fn()
 
     def _stream_buffer_depth(self) -> int:
+        get_depth = getattr(
+            self._workflow_runner._execution_engine, "stream_pipeline_depth", None
+        )
+        if callable(get_depth):
+            return get_depth()
+
         return max(
             (_stream_step_depth(stream_step) for stream_step in self._stream_steps),
             default=0,

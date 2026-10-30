@@ -100,6 +100,15 @@ class ExecutionEngine(BaseExecutionEngine):
             serialize_results=serialize_results,
         )
 
+    def stream_pipeline_depth(self) -> int:
+        """Return the number of frames retained by stream execution.
+
+        Returns:
+            The active stream's output delay in frames.
+        """
+        depth = self._engine.stream_pipeline_depth()
+        return depth
+
     def close(self) -> None:
         """Release resources the workflow's blocks hold between runs.
 

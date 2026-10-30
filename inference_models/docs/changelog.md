@@ -4,6 +4,12 @@
 
 ### Changed
 
+- RF-DETR Triton mask interpolation matches torchvision's horizontal/vertical
+  pass order, fused accumulation and output rounding, preventing rare mask-pixel
+  differences while retaining GPU postprocessing.
+- RF-DETR Triton postprocessing preserves the reference device's equal-score
+  detection order and `max_detections` selection, sorting on-device only for ties.
+
 - `FILE_LOCK_ACQUIRE_TIMEOUT` (`INFERENCE_MODELS_FILE_LOCK_ACQUIRE_TIMEOUT`) defaults to
   600 seconds instead of 20, so a model whose weights package is being downloaded by
   another process waits for that download instead of failing on the package

@@ -216,6 +216,14 @@ def _assert_batched_results_match_reference(
         _assert_detections_equal(actual_detections, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int32])
+def test_triton_falls_back_for_unsupported_mask_dtypes(dtype):
+    kwargs = _support_kwargs()
+    kwargs["image_masks"] = kwargs["image_masks"].to(dtype=dtype)
+
+    assert _unsupported_triton_postprocess_reason(**kwargs) == "mask_dtype_unsupported"
+
+
 def test_rfdetr_triton_postproc_flag_false_bypasses_triton(monkeypatch) -> None:
     monkeypatch.setattr(rfdetr_common, "_TRITON_POSTPROC_ENABLED", False)
 
@@ -447,6 +455,55 @@ def test_rfdetr_triton_postproc_unsupported_cases_use_reference_path(
     )[0]
 
     assert calls == 1
+    _assert_detections_equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or triton_postprocess.triton is None,
+    reason="CUDA and Triton are required",
+)
+@pytest.mark.parametrize("mode", ["single", "multiclass", "ignored"])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("max_detections", [None, 5])
+def test_equal_scores_preserve_reference_order_and_limit(
+    mode, deferred, max_detections
+):
+    from inference_models.models.base.async_handoff import (
+        get_deferred_postprocess_finalizer,
+    )
+
+    device = torch.device("cuda")
+    scores = torch.full((32, 2), 0.1, device=device)
+    scores[:24, 0] = 0.8
+    if mode != "single":
+        scores[:24, 1] = 0.8
+
+    mapping = _class_mapping(device)
+    if mode == "ignored":
+        mapping.class_mapping[1] = -1
+
+    boxes = torch.full((32, 4), 0.25, device=device)
+    boxes[:, 0] = torch.arange(32, device=device) / 64 + 0.2
+    masks = torch.full((32, 8, 8), -2.0, device=device)
+    masks[:, 2:6, 2:6] = 2.0
+    kwargs = dict(
+        image_bboxes=boxes,
+        image_masks=masks,
+        image_meta=_metadata(),
+        threshold=0.4,
+        classes_re_mapping=mapping,
+        max_detections=max_detections,
+    )
+    expected = _post_process_single_instance_segmentation_result_to_rle_masks(
+        image_logits=scores, num_classes=2, **kwargs
+    )
+    actual = post_process_single_instance_segmentation_result_to_rle_masks_triton(
+        image_scores=scores, defer_postprocess_sync=deferred, **kwargs
+    )
+    assert actual is not None
+    if deferred:
+        actual = get_deferred_postprocess_finalizer(actual)()
+
     _assert_detections_equal(actual, expected)
 
 
@@ -1217,3 +1274,57 @@ def test_triton_fractional_boxes_match_final_grid_reference(
     reference_restored = expected.to_supervision()
     np.testing.assert_array_equal(restored.xyxy, reference_restored.xyxy)
     np.testing.assert_array_equal(restored.mask, reference_restored.mask)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or triton_postprocess.triton is None,
+    reason="CUDA and Triton are required",
+)
+@pytest.mark.parametrize("multiclass", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fixture", ["nano", "small"])
+def test_mask_interpolation_preserves_near_zero_sign(
+    multiclass, deferred, dtype, fixture
+):
+    from inference_models.models.base.async_handoff import (
+        get_deferred_postprocess_finalizer,
+    )
+
+    device = torch.device("cuda")
+    boxes = torch.tensor([[0.5, 0.5, 1.0, 1.0]] * 2, device=device)
+    scores = torch.tensor(
+        [[0.95, 0.9 if multiclass else 0.01], [0.01, 0.01]], device=device
+    )
+    # Nano catches implicit reassociation; small catches vertical-first
+    # interpolation. Both come from real failing 1536x864 cropped frames.
+    if fixture == "nano":
+        size, row, column, output_pixel = 78, 40, 17, (451, 359)
+        values = [[2.873046875, -1.25390625], [1.8505859375, 0.327880859375]]
+    else:
+        size, row, column, output_pixel = 96, 59, 61, (535, 987)
+        values = [[-1.77734375, 6.34765625], [-1.767578125, 6.40625]]
+    masks = torch.full((2, size, size), -2.0, device=device, dtype=dtype)
+    masks[0, row : row + 2, column : column + 2] = torch.tensor(
+        values, device=device, dtype=dtype
+    )
+    kwargs = dict(
+        image_bboxes=boxes,
+        image_masks=masks,
+        image_meta=_metadata(height=864, width=1536),
+        threshold=0.4,
+        classes_re_mapping=_class_mapping(device),
+    )
+    expected = _post_process_single_instance_segmentation_result_to_rle_masks(
+        image_logits=scores, num_classes=2, **kwargs
+    )
+    actual = post_process_single_instance_segmentation_result_to_rle_masks_triton(
+        image_scores=scores, defer_postprocess_sync=deferred, **kwargs
+    )
+    assert actual is not None
+    if deferred:
+        actual = get_deferred_postprocess_finalizer(actual)()
+
+    if dtype == torch.float32:
+        assert coco_rle_masks_to_numpy_mask(expected.mask)[(0,) + output_pixel]
+    _assert_detections_equal(actual, expected)

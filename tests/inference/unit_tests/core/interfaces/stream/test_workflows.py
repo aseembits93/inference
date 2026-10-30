@@ -655,6 +655,31 @@ def test_workflow_runner_buffers_frames_until_delayed_prediction_arrives() -> No
     ]
 
 
+def test_workflow_runner_uses_retained_engine_delay_and_releases_frames_on_close():
+    engine = _FakeExecutionEngine(stream_buffer_depth=1)
+    workflow_runner = WorkflowRunner(
+        workflows_parameters=None,
+        execution_engine=engine,
+        image_input_name="image",
+        video_metadata_input_name="video_metadata",
+    )
+    runner = wrap_workflow_runner_for_stream_pipeline(
+        workflow_runner=workflow_runner,
+        execution_engine=engine,
+    )
+    engine.stream_pipeline_depth = lambda: 1
+    engine.step._stream_buffer_depth = 0
+    first, second = _make_frame(1), _make_frame(2)
+
+    assert runner([first]) is None
+    result = runner([second])
+    assert result.video_frames == [first]
+    assert result.predictions == [{"predictions": "frame-1"}]
+    runner.close()
+    assert not runner._pending_video_frames
+    assert engine.step.close_calls == 1
+
+
 def test_workflow_runner_buffers_when_stream_pipeline_activates_after_first_run() -> (
     None
 ):
@@ -830,6 +855,10 @@ def test_instance_segmentation_stream_flush_drains_model_without_rerunning_workf
             }
         ]
     ]
+    assert first_result.response_context_id is None
+    assert second_result.response_context_id == first_result.context_id
+    assert flushed_results[0].response_context_id == second_result.context_id
+    assert flushed_results[0].response_indices == [(0,)]
     assert manager.infer_calls == 2
     assert manager.model.flush_calls == 1
     block.close_stream_pipeline()
